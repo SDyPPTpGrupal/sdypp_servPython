@@ -1,0 +1,11 @@
+# Dependencias de la App Python.
+#
+# Instalación dentro del entorno virtual:
+#   python3 -m venv .venv
+#   source .venv/bin/activate        # Linux / macOS
+#   .venv\Scripts\Activate.ps1       # Windows (PowerShell)
+#   pip install -r requirements.txt
+#
+# redis: contador compartido del rate limiting. Sin esto cada réplica lleva su
+# propia cuenta y el límite deja de ser del servicio (ver Clase01/app.py).
+redis==8.1.0

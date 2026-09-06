@@ -2,3 +2,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .env
+
+# Entornos virtuales: nunca se versionan, llevan binarios y rutas absolutas
+# de la máquina que los creó.
+.venv/
+venv/
+env/

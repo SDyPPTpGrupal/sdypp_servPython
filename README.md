@@ -11,12 +11,24 @@ Servidor HTTP liviano desarrollado en Python para la simulación de despliegues 
 
 ---
 
-## Comandos 
+## Comandos
 
-* python3 -m venv .venv
-* source .venv/bin/activate (Segun el sistema operativo usar el comando correspondiente)
-* pip install -r requirements.txt
-* python3 app.py 8081
+Desde la raíz del repositorio:
+
+```bash
+python3 -m venv .venv
+
+# Activar el entorno, según el sistema operativo:
+source .venv/bin/activate          # Linux / macOS
+# .venv\Scripts\Activate.ps1       # Windows (PowerShell)
+# .venv\Scripts\activate.bat       # Windows (cmd)
+
+pip install -r requirements.txt
+python3 Clase01/app.py 8080
+```
+
+El servidor queda escuchando en `http://0.0.0.0:8080`, que es también el puerto por defecto si no
+se pasa ninguno. Para levantar varias réplicas a la vez, pasarle a cada una un puerto distinto.
 
 ## 🚀 Endpoints de la Aplicación
 
@@ -66,7 +78,7 @@ flowchart TB
     end
 
     subgraph PY["Casa App Python - este repo"]
-        SRC["Clase01/app.py<br/>sin Build: Python no compila"]
+        SRC["Clase01/app.py<br/>Build: venv + pip install -r requirements.txt<br/>no compila, pero resuelve dependencias"]
     end
 
     JAR -->|"Ship: scp por el tunel TCP"| T2
@@ -107,7 +119,7 @@ frenó qué proceso.
 ```mermaid
 flowchart TD
     START(["Cambio trivial en local<br/>subir VERSION y cambiar mensaje"]) --> BUILD
-    BUILD["1 - BUILD<br/>Java compila con mvn hasta el .jar<br/>Python NO tiene este paso"] --> SHIP
+    BUILD["1 - BUILD<br/>Java compila con mvn hasta el .jar<br/>Python arma el venv e instala requirements.txt<br/>los dos resuelven dependencias, uno ademas compila"] --> SHIP
     SHIP["2 - SHIP<br/>scp del archivo por el tunel TCP<br/>con nombre propio, sin pisar el .jar de Java"] --> TUNEL
 
     TUNEL{"Responde el tunel de deploy?"}
@@ -145,8 +157,14 @@ Los comandos exactos de cada paso:
 
 
 ```bash
+# 1 · Build  (en la máquina de quien despliega)
+python3 -m venv .venv
+source .venv/bin/activate          # Linux / macOS
+# .venv\Scripts\Activate.ps1       # Windows (PowerShell)
+pip install -r requirements.txt
+
 # 2 · Ship
-scp -P <PUERTO_NGROK> Clase01/app.py <USUARIO>@<HOST_TCP_NGROK>:/home/<USUARIO>/app-python.py
+scp -P <PUERTO_NGROK> Clase01/app.py requirements.txt <USUARIO>@<HOST_TCP_NGROK>:/home/<USUARIO>/
 
 # 3 · Stop  (dentro del servidor)
 ssh -p <PUERTO_NGROK> <USUARIO>@<HOST_TCP_NGROK>
@@ -168,6 +186,20 @@ enterarse. Recién después va el traspaso ordenado: Stop → Start → Verify.
 ---
 
 ## 🌟 Aportes Propios Justificados
+
+> ℹ️ **Dos de los tres aportes entraron al contrato común** (ver [`CONTRATO.md`](CONTRATO.md)):
+> el rate limiting y la ruta `/slow` ahora los implementan las dos apps, así que están siempre
+> activos.
+>
+> El **checksum** quedó afuera, porque App Java no lo expone: con el balanceador repartiendo,
+> el campo aparecería o no según quién atienda. Se enciende con una variable:
+>
+> ```bash
+> python3 Clase01/app.py 8080                  # respuesta del contrato
+> TP_CHECKSUM=on python3 Clase01/app.py 8080   # con el checksum expuesto
+> ```
+>
+> Los ejemplos del Aporte 2 asumen `TP_CHECKSUM=on`.
 
 ---
 
@@ -248,23 +280,61 @@ Al arrancar, la aplicación lee su propio archivo fuente (`app.py`), calcula su 
 
 ---
 
-### Aporte 3: Rate Limiting en Memoria (Protección contra Sobrecarga)
+### Aporte 3: Rate Limiting con Ventana Deslizante (Protección contra Sobrecarga)
 
 #### ¿En qué consiste?
-Implementación de un limitador de tasa mediante el algoritmo de ventana deslizante en memoria (`Sliding Window`). Cada cliente (IP) puede realizar un máximo de 5 peticiones cada 10 segundos. Al superar este límite, el servidor bloquea temporalmente al cliente respondiendo con código HTTP `429 Too Many Requests`.
+Limitador de tasa por algoritmo de ventana deslizante (`Sliding Window`). Cada cliente (IP)
+puede realizar un máximo de **100 peticiones cada 60 segundos**; al superarlo, el servidor
+responde `429 Too Many Requests`. El código no clava el número: lo toma del enumerado
+`http.HTTPStatus` de la biblioteca estándar, que es la traducción del RFC de HTTP.
+
+El default está elegido para no chocar con el health check del balanceador, que consulta
+`/health` de forma periódica desde una única IP: con un límite muy bajo recibiría `429`,
+interpretaría que la instancia está caída y sacaría de rotación réplicas sanas.
+
+**Cubre todas las rutas, `/health` incluida.** Un endpoint de salud sin límite es el más fácil
+de usar para terminar de tirar abajo un servicio ya degradado, y además suele ser el más público:
+el resto de las rutas puede no estar difundido.
+
+**Dónde vive el contador.** El limitador tiene dos backends intercambiables:
+
+| Backend | Cuándo se usa | Alcance del límite |
+| :--- | :--- | :--- |
+| `memoria` | Por defecto | Por instancia — cada réplica cuenta por su cuenta |
+| `redis` | Con `TP_REDIS_URL` definida | Por servicio — todas las réplicas comparten el contador |
+
+Con réplicas detrás de un balanceador el contador en memoria deja de servir: dos instancias
+llevan cuentas separadas y el límite efectivo se duplica. El backend Redis resuelve eso
+guardando cada IP como un *sorted set* cuyo score es el instante de la petición. El chequeo
+y el alta van en un script Lua para que sean **una sola operación atómica**: si se resolvieran
+en dos viajes, dos réplicas podrían leer el mismo conteo y ambas dejar pasar la petición que
+debía cortarse — el mismo problema de exclusión mutua que resuelve el `Lock` entre hebras,
+pero entre procesos que no comparten memoria.
+
+Si `TP_REDIS_URL` está definida pero Redis no responde, la app **arranca igual** con el
+contador local y lo deja dicho en el log: un Redis caído no debería dejar el servicio afuera.
+
+Variables de entorno: `TP_REDIS_URL`, `TP_RATE_LIMIT_MAX` (100), `TP_RATE_LIMIT_WINDOW` (60).
 
 ---
 
 #### ¿Cómo probarlo?
 
-1. **Enviar ráfaga de peticiones continuas**:
+**Una sola instancia** (contador local):
+
+1. **Bajar el límite para poder mostrarlo sin tirar 100 peticiones**:
    ```bash
-   for i in {1..6}; do curl -s -i http://<IP_ADDRESS>:8080/health | head -n 1; done
+   TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10 python3 Clase01/app.py 8080
    ```
 
-2. **Resultado Observado**:
-   * Peticiones 1 a 5: `HTTP/1.0 200 OK`
-   * Petición 6: `HTTP/1.0 429 Too Many Requests` con el JSON de error:
+2. **Enviar ráfaga de peticiones continuas**:
+   ```bash
+   for i in {1..6}; do curl -s -o /dev/null -w "%{http_code}\n" http://<IP_ADDRESS>:8080/health; done
+   ```
+
+3. **Resultado Observado**:
+   * Peticiones 1 a 5: `200`
+   * Petición 6: `429` con el JSON de error:
      ```json
      {
        "error": "Demasiadas peticiones (429 Too Many Requests)",
@@ -272,6 +342,25 @@ Implementación de un limitador de tasa mediante el algoritmo de ventana desliza
        "ip": "<IP_ADDRESS>"
      }
      ```
+
+**Dos réplicas compartiendo el contador** (es la prueba que importa para el balanceo):
+
+```bash
+docker run -d --rm --name tp-redis -p 6399:6379 redis:7-alpine
+export TP_REDIS_URL="redis://127.0.0.1:6399/0"
+export TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10   # para que corte rápido en la demo
+python3 Clase01/app.py 8101 &
+python3 Clase01/app.py 8102 &
+
+# Alternar entre las dos, como repartiría un balanceador
+for i in {1..4}; do
+  curl -s -o /dev/null -w "A %{http_code}\n" http://127.0.0.1:8101/health
+  curl -s -o /dev/null -w "B %{http_code}\n" http://127.0.0.1:8102/health
+done
+```
+
+Resultado esperado: **cinco `200` en total entre ambas** y `429` desde cualquiera de las dos
+a partir de la sexta — no cinco por cada una.
 
 ## Mejoras al Enunciado
 

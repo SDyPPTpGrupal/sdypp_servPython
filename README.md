@@ -283,6 +283,12 @@ Al arrancar, la aplicación lee su propio archivo fuente (`app.py`), calcula su 
 ### Aporte 3: Rate Limiting con Ventana Deslizante (Protección contra Sobrecarga)
 
 #### ¿En qué consiste?
+
+> **Apagado por defecto.** App Java no limita, así que con el balanceador repartiendo entre las
+> dos implementaciones el mismo cliente recibiría `429` de una réplica y `200` de otra. Quedó
+> como extensión fuera del contrato (§9 de [`CONTRATO.md`](CONTRATO.md)): se enciende con
+> `TP_RATE_LIMIT=on`.
+
 Limitador de tasa por algoritmo de ventana deslizante (`Sliding Window`). Cada cliente (IP)
 puede realizar un máximo de **100 peticiones cada 60 segundos**; al superarlo, el servidor
 responde `429 Too Many Requests`. El código no clava el número: lo toma del enumerado
@@ -300,7 +306,7 @@ el resto de las rutas puede no estar difundido.
 
 | Backend | Cuándo se usa | Alcance del límite |
 | :--- | :--- | :--- |
-| `memoria` | Por defecto | Por instancia — cada réplica cuenta por su cuenta |
+| `memoria` | Sin `TP_REDIS_URL` | Por instancia — cada réplica cuenta por su cuenta |
 | `redis` | Con `TP_REDIS_URL` definida | Por servicio — todas las réplicas comparten el contador |
 
 Con réplicas detrás de un balanceador el contador en memoria deja de servir: dos instancias
@@ -314,7 +320,8 @@ pero entre procesos que no comparten memoria.
 Si `TP_REDIS_URL` está definida pero Redis no responde, la app **arranca igual** con el
 contador local y lo deja dicho en el log: un Redis caído no debería dejar el servicio afuera.
 
-Variables de entorno: `TP_REDIS_URL`, `TP_RATE_LIMIT_MAX` (100), `TP_RATE_LIMIT_WINDOW` (60).
+Variables de entorno: `TP_RATE_LIMIT` (`off`), `TP_REDIS_URL`, `TP_RATE_LIMIT_MAX` (100),
+`TP_RATE_LIMIT_WINDOW` (60). Sin `TP_RATE_LIMIT=on` las otras tres no hacen nada.
 
 ---
 
@@ -322,9 +329,13 @@ Variables de entorno: `TP_REDIS_URL`, `TP_RATE_LIMIT_MAX` (100), `TP_RATE_LIMIT_
 
 **Una sola instancia** (contador local):
 
-1. **Bajar el límite para poder mostrarlo sin tirar 100 peticiones**:
+1. **Encender la extensión y bajar el límite** para poder mostrarlo sin tirar 100 peticiones:
    ```bash
-   TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10 python3 Clase01/app.py 8080
+   TP_RATE_LIMIT=on TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10 python3 Clase01/app.py 8080
+   ```
+   El arranque confirma que quedó activa:
+   ```
+   [rate-limit] 5 peticiones cada 10s por IP, backend 'memoria', todas las rutas (extensión propia, fuera del contrato)
    ```
 
 2. **Enviar ráfaga de peticiones continuas**:
@@ -347,6 +358,7 @@ Variables de entorno: `TP_REDIS_URL`, `TP_RATE_LIMIT_MAX` (100), `TP_RATE_LIMIT_
 
 ```bash
 docker run -d --rm --name tp-redis -p 6399:6379 redis:7-alpine
+export TP_RATE_LIMIT=on                              # la extensión está apagada por defecto
 export TP_REDIS_URL="redis://127.0.0.1:6399/0"
 export TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10   # para que corte rápido en la demo
 python3 Clase01/app.py 8101 &
@@ -361,6 +373,83 @@ done
 
 Resultado esperado: **cinco `200` en total entre ambas** y `429` desde cualquiera de las dos
 a partir de la sexta — no cinco por cada una.
+
+## 🤝 Entrega 2 — Clase 2
+
+La Clase 1 fue una app corriendo en un servidor. La Clase 2 la convierte en un **servicio
+distribuido**: réplicas repartidas entre las casas del grupo, un balanceador que reparte el
+tráfico, estado compartido en una base y despliegues que no cortan el servicio.
+
+El cambio de fondo es que las réplicas dejan de ser "nuestra app". Para un cliente que entra por
+el balanceador, una réplica de App Python y una de App Java tienen que ser **indistinguibles**.
+
+### El contrato con App Java
+
+Al comparar las dos implementaciones lado a lado aparecieron **ocho divergencias**: desde el
+formato del timestamp de arranque hasta qué código devuelve `/echo` sin `ping`. Cualquiera de
+ellas rompe a un cliente que reciba respuestas de una réplica u otra según a quién derivó el
+balanceador.
+
+Están todas resueltas en **[`CONTRATO.md`](CONTRATO.md)** (v1.1), que es la especificación que
+cumplen las dos apps. Ante una diferencia, **manda el contrato**, no este README.
+
+### Extensiones apagadas por defecto
+
+Los aportes propios de la Clase 1 son cosas que **sólo tiene App Python**. Con el balanceador
+repartiendo entre implementaciones distintas, una extensión encendida hace que el servicio
+responda distinto según quién atendió — justo lo que el contrato evita. Por eso quedan detrás de
+un interruptor, apagadas salvo que se pidan:
+
+| Variable | Qué enciende | Default |
+| :--- | :--- | :--- |
+| `TP_CHECKSUM` | El campo `checksum` (SHA-256 del fuente) en `/` y `/health` | `off` |
+| `TP_RATE_LIMIT` | El límite de peticiones por IP y las respuestas `429` | `off` |
+
+Se encienden con `on`, `1`, `true`, `si` o `sí`; cualquier otro valor las deja apagadas.
+
+```bash
+# Comportamiento del contrato — la respuesta es indistinguible de App Java
+python3 Clase01/app.py 8080
+
+# Con las dos extensiones encendidas, para mostrarlas en la demo
+TP_CHECKSUM=on TP_RATE_LIMIT=on python3 Clase01/app.py 8080
+```
+
+Cada extensión encendida deja constancia en el arranque, así que se ve de un vistazo con qué
+configuración quedó levantada una réplica:
+
+```
+[rate-limit] 100 peticiones cada 60s por IP, backend 'memoria', todas las rutas (extensión propia, fuera del contrato)
+[checksum] expuesto en / y /health (extensión propia, fuera del contrato)
+```
+
+### Variables de entorno
+
+| Variable | Para qué | Default |
+| :--- | :--- | :--- |
+| `PORT` | Puerto de escucha. El primer argumento de línea de comandos le gana. | `8080` |
+| `HOST_NAME` | Identidad de la instancia, en el campo `host` de `GET /`. | *hostname* de la máquina |
+| `TP_CHECKSUM` | Enciende la extensión del checksum. | `off` |
+| `TP_RATE_LIMIT` | Enciende la extensión del rate limiting. | `off` |
+| `TP_RATE_LIMIT_MAX` | Peticiones permitidas por ventana. | `100` |
+| `TP_RATE_LIMIT_WINDOW` | Duración de la ventana, en segundos. | `60` |
+| `TP_REDIS_URL` | Contador del rate limiting compartido entre réplicas. | vacío → contador local |
+
+`TP_REDIS_URL` lleva la contraseña de Redis adentro, así que **no se versiona**: va en el `.env`
+de cada nodo, que está en el `.gitignore`.
+
+### Estado
+
+| | Punto | Estado |
+| :--- | :--- | :--- |
+| ✅ | Contrato acordado y App Python al día con la v1.1 | Verificado corriendo las dos apps lado a lado |
+| ✅ | `GET /slow` y graceful shutdown | Vienen de la Clase 1; se reusan para probar el deploy sin downtime |
+| ⬜ | `/personas` sobre Redis (§6 del contrato) | Pendiente |
+| ⬜ | Bitácora a disco, variable `CASA` (§8 del contrato) | Pendiente |
+| ⬜ | `deploy.sh` blue-green con rollback | Pendiente |
+| ⬜ | Dónde corre Redis y qué red une las casas | A definir con el grupo |
+
+---
 
 ## Mejoras al Enunciado
 

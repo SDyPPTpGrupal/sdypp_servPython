@@ -52,22 +52,30 @@ def calculate_checksum() -> str:
 
 CHECKSUM = calculate_checksum()
 
+def _encendido(variable: str) -> bool:
+    """Lee una variable de entorno como interruptor. Apagado si no está definida."""
+    return os.environ.get(variable, "off").strip().lower() in ("on", "1", "true", "si", "sí")
+
+
 # --- Extensión propia, fuera del contrato ---
 # El checksum no existe en la App Java (D-2), así que con el balanceador repartiendo
 # entre réplicas de los dos lenguajes el campo aparecería o no según quién atienda.
 # Queda apagado por defecto; se enciende con TP_CHECKSUM=on para mostrarlo en la demo.
-CHECKSUM_EXPUESTO = os.environ.get("TP_CHECKSUM", "off").strip().lower() in ("on", "1", "true", "si", "sí")
+CHECKSUM_EXPUESTO = _encendido("TP_CHECKSUM")
 
-# --- Rate Limiting (Ventana Deslizante) ---
-# Es parte del contrato: las dos implementaciones tienen que limitar igual, si no
-# el mismo cliente recibiría 429 de una réplica y 200 de otra.
+# --- Rate Limiting (Ventana Deslizante) — extensión propia, fuera del contrato ---
+# La App Java no limita, así que con el balanceador repartiendo entre réplicas de
+# los dos lenguajes el mismo cliente recibiría 429 de una y 200 de otra. Queda
+# apagado por defecto; se enciende con TP_RATE_LIMIT=on.
 #
 # Se aplica a TODAS las rutas, /health incluido. Un endpoint de salud sin límite es
 # el más fácil de usar para terminar de tirar abajo un servicio ya degradado, y
 # además suele ser el más público: el resto de las rutas puede no estar difundido.
 #
 # El default (100 cada 60s) está elegido para no chocar con el health check del
-# balanceador, que consulta /health de forma periódica desde una única IP.
+# balanceador, que consulta /health de forma periódica desde una única IP: si
+# chequea más seguido recibe 429 y termina sacando de rotación réplicas sanas.
+RATE_LIMIT_ACTIVO = _encendido("TP_RATE_LIMIT")
 RATE_LIMIT_MAX = int(os.environ.get("TP_RATE_LIMIT_MAX", 100))
 RATE_LIMIT_WINDOW = int(os.environ.get("TP_RATE_LIMIT_WINDOW", 60))
 REDIS_URL = os.environ.get("TP_REDIS_URL", "")
@@ -155,13 +163,29 @@ class LimitadorRedis:
         return bool(excedido)
 
 
+class LimitadorApagado:
+    """Objeto nulo para cuando la extensión está apagada: nunca excede.
+
+    Evita que el handler tenga que preguntar en cada petición si hay limitador.
+    """
+
+    nombre = "apagado"
+
+    def excede(self, ip: str) -> bool:
+        return False
+
+
 def crear_limitador():
     """Elige el backend del rate limiting según la configuración.
 
-    Sin TP_REDIS_URL la app arranca igual con el contador local: alcanza para el
-    desarrollo y para la demo de una sola instancia. Con réplicas hay que apuntar
-    todas al mismo Redis, si no el límite deja de ser del servicio.
+    Sin TP_RATE_LIMIT=on no se limita nada: es una extensión que la App Java no
+    tiene. Con la extensión encendida pero sin TP_REDIS_URL se usa el contador
+    local, que alcanza para el desarrollo y para la demo de una sola instancia;
+    con réplicas hay que apuntarlas todas al mismo Redis, si no el límite deja de
+    ser del servicio.
     """
+    if not RATE_LIMIT_ACTIVO:
+        return LimitadorApagado()
     if not REDIS_URL:
         print("[rate-limit] contador local de esta instancia (sin TP_REDIS_URL)")
         return LimitadorEnMemoria()
@@ -347,7 +371,8 @@ def run(port: int = 8080):
     signal.signal(signal.SIGTERM, stop_server)
 
     print(f"Servidor iniciado en http://0.0.0.0:{port} (PID: {os.getpid()}) (SHA256: {CHECKSUM[:12]}...) (Arrancado: {ARRANCADO})")
-    print(f"[rate-limit] {RATE_LIMIT_MAX} peticiones cada {RATE_LIMIT_WINDOW}s por IP, backend '{LIMITADOR.nombre}', todas las rutas")
+    if RATE_LIMIT_ACTIVO:
+        print(f"[rate-limit] {RATE_LIMIT_MAX} peticiones cada {RATE_LIMIT_WINDOW}s por IP, backend '{LIMITADOR.nombre}', todas las rutas (extensión propia, fuera del contrato)")
     if CHECKSUM_EXPUESTO:
         print("[checksum] expuesto en / y /health (extensión propia, fuera del contrato)")
     try:

@@ -1,6 +1,6 @@
 # Contrato de servicio — App Java ↔ App Python
 
-**Versión 1.0 — 06/09/2026**
+**Versión 1.1 — 06/09/2026**
 
 Especificación de lo que las dos implementaciones tienen que responder **igual**, para que sean
 intercambiables detrás del balanceador del equipo Plataforma.
@@ -13,7 +13,7 @@ intercambiables detrás del balanceador del equipo Plataforma.
 > divergencias. Un cliente que consume el servicio a través del balanceador recibe respuestas
 > distintas según qué réplica lo atendió, y termina rompiéndose.
 
-**Estado de implementación:** App Python ✅ al día con la v1.0 · App Java ⬜ pendiente (ver §8)
+**Estado de implementación:** App Python ✅ al día con la v1.1 · App Java ⬜ pendiente (ver §7)
 
 ---
 
@@ -142,9 +142,10 @@ Las dos apps leen y escriben sobre **la misma base**. El estado sale de las inst
 
 ### Motor: **Redis**
 
-Ya hace falta un Redis para el contador del rate limiting (§7), y su `INCR` es atómico: garantiza
-que dos réplicas escribiendo al mismo tiempo no se pisen los `id` sin necesidad de coordinación
-entre ellas.
+Su `INCR` es atómico: garantiza que dos réplicas dando de alta al mismo tiempo no se pisen los
+`id` sin necesidad de coordinarse entre ellas. `SETNX` da la misma garantía para detectar legajos
+duplicados. Sin esa atomicidad haría falta un mecanismo de exclusión mutua entre casas, que es un
+problema bastante más grande que el que resuelve.
 
 | Clave | Tipo | Contenido |
 | :--- | :--- | :--- |
@@ -152,6 +153,9 @@ entre ellas.
 | `persona:<id>` | hash | `nombre`, `legajo` |
 | `personas:index` | sorted set | miembro `<id>`, score `<id>` — mantiene el orden de listado |
 | `legajo:<legajo>` | string | `<id>`. Se crea con `SETNX` para detectar duplicados. |
+
+La URL de conexión llega por la variable de entorno **`TP_REDIS_URL`**. Lleva la contraseña
+adentro, así que **no se versiona**: va en el `.env` de cada nodo, que está en el `.gitignore`.
 
 ### `GET /personas` → `200`
 
@@ -187,46 +191,18 @@ entre ellas.
 | Falta `nombre` o `legajo` | `400` | `{"error": "se requieren los campos nombre y legajo"}` |
 | `legajo` no es número | `400` | `{"error": "legajo debe ser numérico"}` |
 | `legajo` ya existe | `409` | `{"error": "el legajo ya está registrado"}` |
+| La base no responde | `503` | `{"error": "base de datos no disponible"}` |
 
 El `id` **lo asigna la base**, nunca la app.
 
----
-
-## 7. Rate limiting
-
-Las dos implementaciones limitan por IP, con **ventana deslizante**.
-
-| Parámetro | Variable | Default |
-| :--- | :--- | :--- |
-| Máximo de peticiones | `TP_RATE_LIMIT_MAX` | `100` |
-| Ventana en segundos | `TP_RATE_LIMIT_WINDOW` | `60` |
-| Contador compartido | `TP_REDIS_URL` | vacío → contador local |
-
-**Al superar el límite:** `429` con
-
-```json
-{
-  "error": "Demasiadas peticiones (429 Too Many Requests)",
-  "mensaje": "Se superó el límite de 100 peticiones cada 60 segundos.",
-  "ip": "..."
-}
-```
-
-Reglas:
-
-- **Se aplica a todas las rutas, `/health` incluido.** Un endpoint de salud sin límite es el
-  camino más fácil para terminar de tirar abajo un servicio ya degradado, y suele ser el más
-  expuesto: el resto de las rutas puede no estar difundido.
-- **El cliente se identifica por `X-Forwarded-For`**, primera IP de la cadena. Sin eso, detrás del
-  balanceador todas las peticiones parecen venir de la misma IP y el límite se aplicaría a todos
-  los clientes en conjunto, como si fueran uno solo.
-- **Con réplicas, el contador va en Redis.** En memoria, cada réplica lleva su propia cuenta y el
-  límite efectivo se multiplica por la cantidad de réplicas.
-- El default `100/60s` está elegido para no chocar con el health check del balanceador. Ver §11.
+> **`503` cuando Redis no está.** `/personas` no tiene degradación posible: sin base no hay datos.
+> Devolver `200` con una lista vacía sería peor que fallar, porque el cliente no puede distinguir
+> "no hay personas cargadas" de "no pude leerlas". Las demás rutas (`/`, `/health`, `/echo`,
+> `/slow`) siguen respondiendo normal: no dependen de la base.
 
 ---
 
-## 8. Qué tiene que cambiar cada equipo
+## 7. Qué tiene que cambiar cada equipo
 
 ### App Java ⬜
 
@@ -234,9 +210,8 @@ Reglas:
 | :--- | :--- | :--- |
 | 1 | `arrancado` sin fracción | `OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS)` |
 | 2 | Agregar `GET /slow` | `Thread.sleep(4000)` y la respuesta de §5 |
-| 3 | Implementar rate limiting | §7, identificando al cliente por la cabecera `X-Forwarded-For` |
-| 4 | Agregar `/personas` | §6 |
-| 5 | Bitácora a disco | §9 |
+| 3 | Agregar `/personas` | §6 |
+| 4 | Bitácora a disco | §8 |
 
 Ya cumple sin cambios: **`equipo` como lista de nombres**, `404`
 `{"error":"ruta no encontrada"}`, `405` `{"error":"metodo no permitido"}`, `POST /echo` sin
@@ -245,11 +220,11 @@ Ya cumple sin cambios: **`equipo` como lista de nombres**, `404`
 ### App Python ✅
 
 Implementado y verificado corriendo las dos apps lado a lado. Pendiente: `/personas` (§6) y la
-bitácora (§9).
+bitácora (§8).
 
 ---
 
-## 9. Bitácora a disco
+## 8. Bitácora a disco
 
 Cada instancia escribe **una línea por operación atendida**, en un archivo del disco local del
 nodo donde corre. Formato idéntico en las dos implementaciones:
@@ -271,39 +246,74 @@ puntual: el balanceador registra a quién derivó, el nodo registra qué hizo.
 
 ---
 
-## 10. Fuera del contrato
+## 9. Fuera del contrato
+
+Extensiones que hoy implementa una sola de las dos apps. **No son obligatorias.** Mientras el
+balanceador reparta entre implementaciones distintas, una extensión activa hace que el servicio
+se comporte distinto según quién atendió — que es exactamente lo que este documento evita. Por eso
+van apagadas salvo que se acuerde incorporarlas, y ese acuerdo sube la versión del contrato.
 
 | Extensión | De quién | Estado |
 | :--- | :--- | :--- |
-| `checksum` (SHA-256 del fuente) en `/` y `/health` | App Python | Apagado por defecto |
+| `checksum` (SHA-256 del fuente) en `/` y `/health` | App Python | Apagada por defecto |
+| Rate limiting por IP con ventana deslizante | App Python | A definir con el grupo |
 
-App Java no lo implementa, así que con el balanceador repartiendo el campo aparecería o no según
-quién atienda. Queda detrás de una variable, apagado salvo que se pida explícitamente:
+### `checksum`
+
+Agrega un campo extra a las respuestas de `/` y `/health` con el SHA-256 del fuente en ejecución,
+para verificar qué versión exacta del código está corriendo cada réplica. Queda detrás de una
+variable:
 
 ```bash
 python3 Clase01/app.py 8080                  # respuesta del contrato
 TP_CHECKSUM=on python3 Clase01/app.py 8080   # con el checksum expuesto
 ```
 
+### Rate limiting
+
+Limita las peticiones por IP en una ventana deslizante y devuelve `429` al superar el límite.
+
+| Parámetro | Variable | Default |
+| :--- | :--- | :--- |
+| Máximo de peticiones | `TP_RATE_LIMIT_MAX` | `100` |
+| Ventana en segundos | `TP_RATE_LIMIT_WINDOW` | `60` |
+| Contador compartido | `TP_REDIS_URL` | vacío → contador local por réplica |
+
+Si el grupo decide incorporarlo al contrato, hay tres cosas que tienen que quedar cerradas al
+mismo tiempo:
+
+1. **App Java lo implementa también.** Si no, el límite se aplica sólo a una parte de las réplicas
+   y el comportamiento del servicio depende de a quién derivó el balanceador.
+2. **El contador va en Redis.** En memoria, cada réplica lleva su propia cuenta y el límite
+   efectivo se multiplica por la cantidad de réplicas.
+3. **El cliente se identifica por `X-Forwarded-For`** (§10). Detrás del balanceador, todas las
+   peticiones llegan con la misma IP de origen: sin esa cabecera el límite se aplicaría a todos
+   los clientes en conjunto, como si fueran uno solo.
+
+Y una consecuencia para Plataforma: con `100/60s`, el health check no puede consultar más de una
+vez por segundo por instancia. Si chequea más seguido recibe `429`, interpreta que la instancia
+está caída y **saca de rotación réplicas sanas**.
+
 ---
 
-## 11. Requisitos para el equipo Plataforma
+## 10. Requisitos para el equipo Plataforma
 
 No son parte del contrato entre las apps, pero el balanceador depende de esto:
 
-1. **Propagar `X-Forwarded-For`** con la IP del cliente original. Sin eso, el rate limiting de
-   ambas apps trata a todos los clientes como uno solo.
-2. **Health check a lo sumo 1 vez por segundo por instancia.** El límite es 100 cada 60 s por IP y
-   el balanceador consulta desde una única IP: si chequea más seguido recibe `429`, interpreta que
-   la instancia está caída y **saca de rotación réplicas sanas**.
-3. **Definir qué considera "instancia sana".** Si alcanza con `200` en `/health` o si el chequeo
-   también tiene que verificar la base. Una instancia puede responder `200` y devolver datos
-   corruptos: un health check superficial no la saca de rotación.
+1. **Propagar `X-Forwarded-For`** con la IP del cliente original. Hoy ninguna ruta del contrato la
+   usa, pero sin esa cabecera las apps no tienen forma de saber quién es el cliente real: todo
+   llega con la IP del balanceador. Es la condición para cualquier control o registro por cliente
+   —el rate limiting de §9 entre ellos— y agregarla después es más caro que dejarla desde el
+   principio.
+2. **Definir qué considera "instancia sana".** Si alcanza con `200` en `/health` o si el chequeo
+   también tiene que verificar la base. Una instancia puede responder `200` en `/health` y `503`
+   en `/personas`: un health check superficial no la saca de rotación.
 
 ---
 
-## 12. Registro de versiones
+## 11. Registro de versiones
 
 | Versión | Fecha | Cambios |
 | :--- | :--- | :--- |
 | 1.0 | 06/09/2026 | Contrato inicial. Resuelve las ocho divergencias detectadas entre las dos implementaciones y agrega `/personas`, bitácora y rate limiting. |
+| 1.1 | 06/09/2026 | El rate limiting sale del contrato y pasa a §9 como extensión, pendiente de acuerdo con el grupo. Se agrega el `503` de `/personas` cuando la base no responde. |

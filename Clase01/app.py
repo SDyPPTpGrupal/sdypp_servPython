@@ -7,6 +7,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -17,10 +18,12 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 # las mismas claves, con los mismos tipos y en el mismo orden.
 APP_NAME = "python"
 LENGUAJE = f"Python {platform.python_version()}"
+# Un objeto por integrante: el legajo es un campo propio y no un dato embutido en
+# el string del nombre, que obligaría al cliente a parsear por paréntesis (D-1).
 EQUIPO = [
-    "Tomás",
-    "Mateo",
-    "Salvador",
+    {"nombre": "Tomás", "apellido": "Resnik", "legajo": 190168},
+    {"nombre": "Mateo", "apellido": "Nomico", "legajo": 168102},
+    {"nombre": "Salvador", "apellido": "Baez", "legajo": 195157},
 ]
 VERSION = 1
 MENSAJE = "hola mundo python"
@@ -38,6 +41,7 @@ RUTAS = {
     "/health": {"GET"},
     "/slow": {"GET"},
     "/echo": {"POST"},
+    "/personas": {"GET", "POST"},
 }
 
 
@@ -56,6 +60,19 @@ def _encendido(variable: str) -> bool:
     """Lee una variable de entorno como interruptor. Apagado si no está definida."""
     return os.environ.get(variable, "off").strip().lower() in ("on", "1", "true", "si", "sí")
 
+
+def _url_sin_credenciales(url: str) -> str:
+    """Recorta la contraseña de una URL antes de escribirla en el log.
+
+    TP_REDIS_URL lleva la credencial adentro y el log va a parar a un archivo del
+    disco de la casa: escribirla entera la filtraría a cualquiera que lo lea.
+    """
+    try:
+        partes = urllib.parse.urlsplit(url)
+        puerto = f":{partes.port}" if partes.port else ""
+        return f"{partes.scheme}://{partes.hostname or '?'}{puerto}"
+    except Exception:
+        return "(url ilegible)"
 
 # --- Extensión propia, fuera del contrato ---
 # El checksum no existe en la App Java (D-2), así que con el balanceador repartiendo
@@ -191,7 +208,7 @@ def crear_limitador():
         return LimitadorEnMemoria()
     try:
         limitador = LimitadorRedis(REDIS_URL)
-        print(f"[rate-limit] contador compartido en Redis ({REDIS_URL})")
+        print(f"[rate-limit] contador compartido en Redis ({_url_sin_credenciales(REDIS_URL)})")
         return limitador
     except Exception as e:
         # Preferimos degradar antes que no levantar: un Redis caído no debería
@@ -201,6 +218,164 @@ def crear_limitador():
 
 
 LIMITADOR = crear_limitador()
+
+
+# --- Estado compartido: /personas sobre la base (§6 del contrato) ---
+# Los datos no viven en la memoria de ninguna instancia: las réplicas quedan
+# stateless, cualquiera puede atender cualquier petición y la que se muere no se
+# lleva nada consigo. Es lo que hace que el balanceador pueda repartir sin que el
+# cliente note quién lo atendió.
+
+# Límites de validación (§6). El tope del legajo es el máximo de un entero de 32
+# bits: Python maneja enteros de precisión ilimitada, pero un int de Java desborda,
+# así que el contrato se fija en el más restrictivo de los dos lenguajes.
+LEGAJO_MIN = 1
+LEGAJO_MAX = 2147483647
+NOMBRE_MAX = 120
+
+
+class BaseNoDisponible(Exception):
+    """La base compartida no respondió. Se traduce en un 503."""
+
+
+# El alta tiene que ser atómica de punta a punta. Entre comprobar que el legajo no
+# está registrado y escribirlo, otra réplica puede colarse con el mismo legajo; y
+# entre pedir el id y usarlo, otra puede pedir el mismo. Redis corre el script
+# entero sin intercalar comandos de otros clientes, así que las cinco operaciones
+# valen por una. Es el mismo problema de exclusión mutua del rate limiting, y es lo
+# que nos ahorra tener que coordinar las casas entre sí para dar de alta a alguien.
+_LUA_ALTA_PERSONA = """
+local clave_legajo = KEYS[1]
+local nombre = ARGV[1]
+local legajo = ARGV[2]
+
+if redis.call('EXISTS', clave_legajo) == 1 then
+  return -1
+end
+
+local id = redis.call('INCR', 'personas:seq')
+redis.call('HSET', 'persona:' .. id, 'nombre', nombre, 'legajo', legajo)
+redis.call('ZADD', 'personas:index', id, id)
+redis.call('SET', clave_legajo, id)
+return id
+"""
+
+
+class RepositorioPersonas:
+    """Acceso a la base compartida con el esquema de claves de §6 del contrato.
+
+    El esquema es contrato tanto como el JSON: si la App Java guardara la misma
+    persona bajo otra clave o con otra estructura, las dos apps escribirían en la
+    misma base sin encontrar lo del otro.
+    """
+
+    def __init__(self, url: str):
+        import redis  # dependencia externa, ver requirements.txt
+
+        self._cliente = redis.Redis.from_url(
+            url,
+            decode_responses=True,
+            socket_timeout=1,
+            socket_connect_timeout=1,
+        )
+        # register_script no viaja a Redis, sólo calcula el SHA del script. Así el
+        # repositorio se construye aunque la base esté caída y empieza a funcionar
+        # solo cuando vuelve, sin reiniciar la réplica.
+        self._alta = self._cliente.register_script(_LUA_ALTA_PERSONA)
+
+    def listar(self) -> list:
+        """Personas ordenadas por id ascendente.
+
+        El orden sale del sorted set: sin un orden fijo, dos réplicas devuelven el
+        mismo conjunto en distinta secuencia y el servicio parece errático.
+        """
+        try:
+            ids = self._cliente.zrange("personas:index", 0, -1)
+            tuberia = self._cliente.pipeline()
+            for identificador in ids:
+                tuberia.hgetall(f"persona:{identificador}")
+            registros = tuberia.execute()
+        except Exception as e:
+            raise BaseNoDisponible(e)
+
+        personas = []
+        for identificador, registro in zip(ids, registros):
+            if not registro:
+                continue  # el índice quedó apuntando a una persona borrada a mano
+            personas.append({
+                "id": int(identificador),
+                "nombre": registro["nombre"],
+                "legajo": int(registro["legajo"]),
+            })
+        return personas
+
+    def crear(self, nombre: str, legajo: int):
+        """Da de alta y devuelve el id, o None si el legajo ya estaba registrado.
+
+        El id lo asigna la base (INCR), nunca la app: si lo calculara cada réplica
+        contando lo que ya hay, dos altas simultáneas se pisarían.
+        """
+        try:
+            resultado = self._alta(keys=[f"legajo:{legajo}"], args=[nombre, legajo])
+        except Exception as e:
+            raise BaseNoDisponible(e)
+        return None if int(resultado) == -1 else int(resultado)
+
+
+def crear_repositorio():
+    """Prepara el acceso a la base. Sin TP_REDIS_URL, /personas responde 503.
+
+    Un fallo acá (falta la librería, URL mal escrita) no tiene que impedir que la
+    réplica arranque: las otras rutas no dependen de la base y el balanceador la
+    tiene que poder seguir usando.
+    """
+    if not REDIS_URL:
+        return None
+    try:
+        return RepositorioPersonas(REDIS_URL)
+    except Exception as e:
+        print(f"[personas] no se pudo preparar el acceso a la base ({e}); /personas responde 503")
+        return None
+
+
+REPOSITORIO = crear_repositorio()
+
+
+def validar_persona(payload: dict):
+    """Valida el cuerpo de POST /personas en el orden que fija §6 del contrato.
+
+    Devuelve (datos, error). El orden es parte del contrato: ante un cuerpo con dos
+    problemas a la vez, las dos implementaciones tienen que devolver el mismo error
+    y no cada una el que detectó primero.
+    """
+    nombre = payload.get("nombre")
+    legajo = payload.get("legajo")
+    limpio = nombre.strip() if isinstance(nombre, str) else nombre
+
+    # 2. Presencia. Un nombre que queda vacío después del trim cuenta como ausente,
+    #    igual que la clave que no vino o la que vale null.
+    if nombre is None or legajo is None or limpio == "":
+        return None, "se requieren los campos nombre y legajo"
+
+    # 3. Entero de verdad. En Python isinstance(True, int) es True, así que el
+    #    booleano hay que descartarlo aparte. El string numérico y el decimal
+    #    también caen acá: convertirlos obligaría a las dos apps a coincidir en qué
+    #    hacer con "0100200", " 100200 " y "1e5".
+    if isinstance(legajo, bool) or not isinstance(legajo, int):
+        return None, "legajo debe ser numérico"
+
+    # 4. Rango.
+    if not LEGAJO_MIN <= legajo <= LEGAJO_MAX:
+        return None, "legajo fuera de rango"
+
+    # 5. Nombre string y acotado, medido sobre el valor ya trimeado.
+    if not isinstance(limpio, str) or len(limpio) > NOMBRE_MAX:
+        return None, "nombre inválido"
+
+    # Los campos de más se ignoran, incluido un id que venga en el cuerpo: el id lo
+    # asigna la base. Ignorarlos es lo que permite que el contrato crezca sin
+    # romper a un cliente viejo.
+    return {"nombre": limpio, "legajo": legajo}, None
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -243,6 +418,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._ruta_slow()
         elif path == "/echo":
             self._ruta_echo()
+        elif path == "/personas":
+            if metodo == "GET":
+                self._ruta_personas_listar()
+            else:
+                self._ruta_personas_alta()
 
     def _ruta_raiz(self):
         response_data = {
@@ -286,20 +466,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         print("[/slow] Petición lenta finalizada.")
 
     def _ruta_echo(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "se requiere el campo ping"})
-            return
-
-        try:
-            body = self.rfile.read(content_length)
-            payload = json.loads(body.decode("utf-8"))
-        except Exception:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "JSON inválido"})
+        payload, error = self._leer_cuerpo_json()
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
             return
 
         # Sin el campo ping la petición es inválida: 400, no un pong vacío (D-5).
-        if not isinstance(payload, dict) or "ping" not in payload:
+        if "ping" not in payload:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "se requiere el campo ping"})
             return
 
@@ -308,6 +481,90 @@ class RequestHandler(BaseHTTPRequestHandler):
             "servidoPor": APP_NAME,
             "version": VERSION,
         })
+
+    def _ruta_personas_listar(self):
+        """GET /personas — lo guardado en la base, ordenado por id."""
+        if REPOSITORIO is None:
+            self._base_no_disponible("no hay TP_REDIS_URL configurada")
+            return
+        try:
+            personas = REPOSITORIO.listar()
+        except BaseNoDisponible as e:
+            self._base_no_disponible(e)
+            return
+
+        self._send_json(HTTPStatus.OK, {
+            "servidoPor": APP_NAME,
+            "personas": personas,
+        })
+
+    def _ruta_personas_alta(self):
+        """POST /personas — alta con la validación y el orden de §6."""
+        payload, error = self._leer_cuerpo_json()
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+
+        datos, error = validar_persona(payload)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+
+        if REPOSITORIO is None:
+            self._base_no_disponible("no hay TP_REDIS_URL configurada")
+            return
+        try:
+            identificador = REPOSITORIO.crear(datos["nombre"], datos["legajo"])
+        except BaseNoDisponible as e:
+            self._base_no_disponible(e)
+            return
+
+        if identificador is None:
+            self._send_json(HTTPStatus.CONFLICT, {"error": "el legajo ya está registrado"})
+            return
+
+        self._send_json(HTTPStatus.CREATED, {
+            "servidoPor": APP_NAME,
+            "id": identificador,
+            "nombre": datos["nombre"],
+            "legajo": datos["legajo"],
+        })
+
+    def _base_no_disponible(self, motivo):
+        """503 de /personas.
+
+        No hay degradación posible: sin base no hay datos. Devolver 200 con una
+        lista vacía sería peor que fallar, porque el cliente no podría distinguir
+        "no hay personas cargadas" de "no pude leerlas". Las demás rutas siguen
+        respondiendo normal: no dependen de la base.
+        """
+        print(f"[personas] la base no respondió: {motivo}")
+        self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "base de datos no disponible"})
+
+    def _leer_cuerpo_json(self):
+        """Lee el cuerpo como objeto JSON. Devuelve (payload, error).
+
+        No se exige Content-Type: application/json — se parsea el cuerpo venga con
+        el header que venga, porque un `curl -d` manda x-www-form-urlencoded por
+        defecto y perder una petición válida por eso no le sirve a nadie.
+        """
+        try:
+            largo = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            largo = 0
+        if largo <= 0:
+            return None, "cuerpo JSON inválido"
+
+        try:
+            payload = json.loads(self.rfile.read(largo).decode("utf-8"))
+        except Exception:
+            return None, "cuerpo JSON inválido"
+
+        # Un array o un escalar son JSON válido pero no un cuerpo válido: los
+        # campos se buscan por nombre.
+        if not isinstance(payload, dict):
+            return None, "cuerpo JSON inválido"
+        return payload, None
 
     def _rate_limited(self) -> bool:
         """Aplica el límite a la petición en curso.
@@ -358,6 +615,13 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 
 def run(port: int = 8080):
+    # En el deploy la réplica arranca con `nohup ... > python.log`, y ahí stdout no
+    # es una terminal: Python lo bufferiza por bloques y el log queda vacío hasta
+    # que se llenan varios KB. Sin esto, el banner de arranque y los avisos del
+    # graceful shutdown no aparecen cuando hacen falta, que es justo mientras se
+    # está mirando el log para ver si el deploy salió bien.
+    sys.stdout.reconfigure(line_buffering=True)
+
     server_address = ("0.0.0.0", port)
     httpd = ThreadingHTTPServer(server_address, RequestHandler)
 
@@ -375,6 +639,10 @@ def run(port: int = 8080):
         print(f"[rate-limit] {RATE_LIMIT_MAX} peticiones cada {RATE_LIMIT_WINDOW}s por IP, backend '{LIMITADOR.nombre}', todas las rutas (extensión propia, fuera del contrato)")
     if CHECKSUM_EXPUESTO:
         print("[checksum] expuesto en / y /health (extensión propia, fuera del contrato)")
+    if REPOSITORIO is None:
+        print("[personas] sin TP_REDIS_URL: /personas responde 503 (§6 del contrato)")
+    else:
+        print(f"[personas] base compartida en {_url_sin_credenciales(REDIS_URL)}")
     try:
         httpd.serve_forever()
     finally:

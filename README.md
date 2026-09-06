@@ -30,6 +30,23 @@ python3 Clase01/app.py 8080
 El servidor queda escuchando en `http://0.0.0.0:8080`, que es también el puerto por defecto si no
 se pasa ninguno. Para levantar varias réplicas a la vez, pasarle a cada una un puerto distinto.
 
+`/personas` necesita la base compartida. Para levantarla localmente y apuntar dos réplicas a la
+misma:
+
+```bash
+docker run -d --name tp-redis -p 6379:6379 redis:8-alpine
+
+export TP_REDIS_URL=redis://127.0.0.1:6379/0
+HOST_NAME=casa-tomas-1 python3 Clase01/app.py 8101 &
+HOST_NAME=casa-tomas-2 python3 Clase01/app.py 8102 &
+
+# el alta la atiende una réplica y la lectura la otra: el dato está igual
+curl -s -X POST -d '{"nombre":"Ada Lovelace","legajo":100200}' http://127.0.0.1:8101/personas
+curl -s http://127.0.0.1:8102/personas
+```
+
+Sin `TP_REDIS_URL`, `/personas` responde `503`; las demás rutas siguen funcionando normal.
+
 ## 🚀 Endpoints de la Aplicación
 
 | Método | Ruta | Descripción |
@@ -38,6 +55,11 @@ se pasa ninguno. Para levantar varias réplicas a la vez, pasarle a cada una un 
 | `GET` | `/health` | Chequeo de salud del servicio (retorna `{"status": "ok"}`). |
 | `POST` | `/echo` | Recibe JSON `{"ping": "mensaje"}` y responde `{"pong": "mensaje"}`. |
 | `GET` | `/slow` | Endpoint simulador de peticiones en vuelo (sleep de 4s) para probar **Graceful Shutdown**. |
+| `GET` | `/personas` | Lista lo guardado en la base compartida, ordenado por `id`. |
+| `POST` | `/personas` | Alta. Recibe `{"nombre": "...", "legajo": 123}` y devuelve `201` con la persona creada. |
+
+Las reglas de validación de `/personas`, el orden en que se aplican y la matriz de casos borde
+están en **[`CONTRATO.md`](CONTRATO.md) §6** — son contrato, no detalle de implementación.
 
 ---
 
@@ -187,19 +209,19 @@ enterarse. Recién después va el traspaso ordenado: Stop → Start → Verify.
 
 ## 🌟 Aportes Propios Justificados
 
-> ℹ️ **Dos de los tres aportes entraron al contrato común** (ver [`CONTRATO.md`](CONTRATO.md)):
-> el rate limiting y la ruta `/slow` ahora los implementan las dos apps, así que están siempre
-> activos.
+> ℹ️ **De los tres aportes, uno entró al contrato común** (ver [`CONTRATO.md`](CONTRATO.md)):
+> la ruta `/slow` del graceful shutdown, que ahora implementan las dos apps y está siempre activa.
 >
-> El **checksum** quedó afuera, porque App Java no lo expone: con el balanceador repartiendo,
-> el campo aparecería o no según quién atienda. Se enciende con una variable:
+> El **checksum** y el **rate limiting** quedaron afuera, porque App Java no los tiene: con el
+> balanceador repartiendo entre las dos, el servicio respondería distinto según quién atendió.
+> Siguen en el código de App Python detrás de un interruptor, **apagados por defecto**:
 >
 > ```bash
-> python3 Clase01/app.py 8080                  # respuesta del contrato
-> TP_CHECKSUM=on python3 Clase01/app.py 8080   # con el checksum expuesto
+> python3 Clase01/app.py 8080                                    # respuesta del contrato
+> TP_CHECKSUM=on TP_RATE_LIMIT=on python3 Clase01/app.py 8080     # con las dos extensiones
 > ```
 >
-> Los ejemplos del Aporte 2 asumen `TP_CHECKSUM=on`.
+> Los ejemplos de los Aportes 2 y 3 asumen la variable correspondiente encendida.
 
 ---
 
@@ -390,8 +412,16 @@ formato del timestamp de arranque hasta qué código devuelve `/echo` sin `ping`
 ellas rompe a un cliente que reciba respuestas de una réplica u otra según a quién derivó el
 balanceador.
 
-Están todas resueltas en **[`CONTRATO.md`](CONTRATO.md)** (v1.1), que es la especificación que
+Están todas resueltas en **[`CONTRATO.md`](CONTRATO.md)** (v1.3), que es la especificación que
 cumplen las dos apps. Ante una diferencia, **manda el contrato**, no este README.
+
+Tres de esas decisiones venían de la corrección de la Clase 1 y quedaron cerradas en la v1.2:
+
+| Campo | Decisión | Por qué |
+| :--- | :--- | :--- |
+| `equipo` | Lista de **objetos** con `nombre`, `apellido` y `legajo` | El legajo viajaba embutido en el string del nombre, `"Tomás Resnik (Legajo 190168)"`, y había que parsear por paréntesis para sacarlo. Con un campo por dato no queda nada que parsear. |
+| `mensaje` | **Texto plano** | Se evaluó darle estructura. Hoy su único uso es hacer visible el cambio de contenido en cada deploy: una estructura que ningún cliente consume es una forma más de divergir entre las dos apps. |
+| `checksum` | **Fuera del contrato** | El hash de un `.py` no es comparable contra el de un `.jar`, así que el campo no permitiría contrastar dos réplicas: sólo mirar cada una por separado. Queda como diagnóstico de App Python. |
 
 ### Extensiones apagadas por defecto
 
@@ -433,18 +463,19 @@ configuración quedó levantada una réplica:
 | `TP_RATE_LIMIT` | Enciende la extensión del rate limiting. | `off` |
 | `TP_RATE_LIMIT_MAX` | Peticiones permitidas por ventana. | `100` |
 | `TP_RATE_LIMIT_WINDOW` | Duración de la ventana, en segundos. | `60` |
-| `TP_REDIS_URL` | Contador del rate limiting compartido entre réplicas. | vacío → contador local |
+| `TP_REDIS_URL` | **Base compartida de `/personas`** y, además, contador del rate limiting compartido entre réplicas. | vacío → `/personas` responde `503` y el contador es local |
 
 `TP_REDIS_URL` lleva la contraseña de Redis adentro, así que **no se versiona**: va en el `.env`
-de cada nodo, que está en el `.gitignore`.
+de cada nodo, que está en el `.gitignore`. La app nunca la escribe entera en el log: recorta el
+usuario y la contraseña antes de imprimirla.
 
 ### Estado
 
 | | Punto | Estado |
 | :--- | :--- | :--- |
-| ✅ | Contrato acordado y App Python al día con la v1.1 | Verificado corriendo las dos apps lado a lado |
+| ✅ | Contrato acordado y App Python al día con la v1.3 | Verificado corriendo las dos apps lado a lado |
 | ✅ | `GET /slow` y graceful shutdown | Vienen de la Clase 1; se reusan para probar el deploy sin downtime |
-| ⬜ | `/personas` sobre Redis (§6 del contrato) | Pendiente |
+| ✅ | `/personas` sobre Redis, con la validación y la matriz de casos de §6 | Alta atómica por script Lua: verificado con 25 altas simultáneas del mismo legajo (1 × `201`, 24 × `409`) y 40 concurrentes con `id` consecutivos sin huecos |
 | ⬜ | Bitácora a disco, variable `CASA` (§8 del contrato) | Pendiente |
 | ⬜ | `deploy.sh` blue-green con rollback | Pendiente |
 | ⬜ | Dónde corre Redis y qué red une las casas | A definir con el grupo |

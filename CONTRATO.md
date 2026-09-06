@@ -1,6 +1,6 @@
 # Contrato de servicio — App Java ↔ App Python
 
-**Versión 1.1 — 06/09/2026**
+**Versión 1.3 — 06/09/2026**
 
 Especificación de lo que las dos implementaciones tienen que responder **igual**, para que sean
 intercambiables detrás del balanceador del equipo Plataforma.
@@ -13,7 +13,7 @@ intercambiables detrás del balanceador del equipo Plataforma.
 > divergencias. Un cliente que consume el servicio a través del balanceador recibe respuestas
 > distintas según qué réplica lo atendió, y termina rompiéndose.
 
-**Estado de implementación:** App Python ✅ al día con la v1.1 · App Java ⬜ pendiente (ver §7)
+**Estado de implementación:** App Python ✅ al día con la v1.3 salvo la bitácora · App Java ⬜ pendiente (ver §7)
 
 ---
 
@@ -48,7 +48,11 @@ vista y detectar una divergencia sin herramientas.
 {
   "app": "python",
   "lenguaje": "Python 3.14.7",
-  "equipo": ["Tomás", "Mateo", "Salvador"],
+  "equipo": [
+    { "nombre": "Tomás", "apellido": "Resnik", "legajo": 190168 },
+    { "nombre": "Mateo", "apellido": "Nomico", "legajo": 168102 },
+    { "nombre": "Salvador", "apellido": "Baez", "legajo": 195157 }
+  ],
   "version": 1,
   "mensaje": "hola mundo python",
   "host": "casa-tomas",
@@ -60,18 +64,25 @@ vista y detectar una divergencia sin herramientas.
 | :--- | :--- | :--- |
 | `app` | string | `"python"` o `"java"`. Es lo que permite ver qué implementación atendió. |
 | `lenguaje` | string | Texto libre, informativo. |
-| `equipo` | array de strings | Un string por integrante, **sólo el nombre de pila**. Sin apellido y sin legajo. |
+| `equipo` | array de objetos | Un objeto por integrante, con `nombre` (string), `apellido` (string) y `legajo` (number). |
 | `version` | number | Entero. Lo que cambia en cada deploy. |
-| `mensaje` | string | Texto libre. Lo que cambia en cada deploy. |
+| `mensaje` | string | Texto plano. Lo que cambia en cada deploy. |
 | `host` | string | Valor de `HOST_NAME`. |
 | `arrancado` | string | ISO-8601 con offset, **precisión de segundos, sin fracción**. |
 
-> **`equipo` es una lista de nombres de pila.** App Python venía mandando
-> `"Tomás Resnik (Legajo 190168)"`: un dato compuesto que obliga a parsear un string para extraer
-> el legajo, y que además no coincidía con el formato de App Java. Al dejar sólo el nombre no
-> queda nada que parsear y ambas implementaciones mandan lo mismo.
+> **`equipo` es una lista de objetos, no de strings.** App Python venía mandando
+> `"Tomás Resnik (Legajo 190168)"` y App Java `"Agustina"`: dos formatos distintos, y el primero
+> obliga a parsear por paréntesis para sacar el legajo. Con un campo por dato no queda nada que
+> parsear y las dos implementaciones mandan la misma estructura.
 >
-> Los legajos de cada equipo van en el README de su repositorio, no en la respuesta HTTP.
+> El `legajo` es **number**, no string: es el campo por el que un cliente identifica a una persona,
+> y es el mismo tipo que usa `/personas` en §6.
+
+> **`mensaje` es texto plano.** Es el campo que un cliente procesaría de verdad —los demás son
+> metadatos de la instancia—, así que se evaluó darle estructura propia. Se deja plano a
+> propósito: hoy su único uso es hacer visible el cambio de contenido en cada deploy, y una
+> estructura que ningún cliente consume es una forma más de divergir entre las dos apps. Si
+> alguna vez transporta datos, cambia acá y sube la versión del contrato.
 
 > **`arrancado` sin fracción de segundo.** Java devuelve nanosegundos por defecto
 > (`2026-09-06T12:33:34.270495056-03:00`), lo cual no es comparable contra la otra implementación.
@@ -172,8 +183,11 @@ adentro, así que **no se versiona**: va en el `.env` de cada nodo, que está en
   devuelven el mismo conjunto en distinta secuencia y el servicio parece comportarse de forma
   errática.
 - Sin personas cargadas: `200` con `"personas": []`. **No** es `404`.
-- `nombre` es el **nombre completo en un solo campo**. No contradice el `equipo` de §2: son dos
-  estructuras distintas, con propósitos distintos.
+- `nombre` es el **nombre completo en un solo campo**, a diferencia del `equipo` de §2, que separa
+  `nombre` y `apellido`. La asimetría es deliberada: el `equipo` es un dato fijo del contrato, que
+  las dos apps escriben a mano y del que se conoce el legajo; una persona es un dato que carga el
+  cliente, y partirlo en dos campos obliga a decidir qué pasa con los nombres compuestos. Si el
+  grupo prefiere unificar las dos formas, se cambia acá y sube la versión.
 
 ### `POST /personas`
 
@@ -188,12 +202,92 @@ adentro, así que **no se versiona**: va en el `.env` de cada nodo, que está en
 | Situación | Código | Cuerpo |
 | :--- | :--- | :--- |
 | Alta correcta | `201` | la persona creada + `servidoPor` |
-| Falta `nombre` o `legajo` | `400` | `{"error": "se requieren los campos nombre y legajo"}` |
-| `legajo` no es número | `400` | `{"error": "legajo debe ser numérico"}` |
-| `legajo` ya existe | `409` | `{"error": "el legajo ya está registrado"}` |
+| Cuerpo ausente, no parseable como JSON, o que no es un objeto | `400` | `{"error": "cuerpo JSON inválido"}` |
+| Falta `nombre` o falta `legajo` | `400` | `{"error": "se requieren los campos nombre y legajo"}` |
+| `legajo` no es un entero | `400` | `{"error": "legajo debe ser numérico"}` |
+| `legajo` entero pero fuera de rango | `400` | `{"error": "legajo fuera de rango"}` |
+| `nombre` no es string, o supera los 120 caracteres | `400` | `{"error": "nombre inválido"}` |
+| `legajo` ya registrado | `409` | `{"error": "el legajo ya está registrado"}` |
 | La base no responde | `503` | `{"error": "base de datos no disponible"}` |
 
 El `id` **lo asigna la base**, nunca la app.
+
+### Validación: reglas y casos borde
+
+Las dos apps validan **igual** y en **este orden**. El orden es parte del contrato: ante un cuerpo
+con dos problemas a la vez, las dos tienen que devolver el mismo error, no cada una el que detectó
+primero.
+
+1. **El cuerpo tiene que ser un objeto JSON.** Vacío, texto suelto, un array o un escalar → `400`
+   `cuerpo JSON inválido`. **No se exige `Content-Type: application/json`**: se parsea el cuerpo
+   venga con el header que venga. (Un `curl -d` manda `application/x-www-form-urlencoded` por
+   defecto, y perder la demo por eso sería absurdo.)
+2. **Presencia de `nombre` y `legajo`.** Cuenta como ausente: la clave que no está, la que vale
+   `null`, y un `nombre` que queda vacío después del trim. Las claves son **case-sensitive**:
+   `"Nombre"` no es `"nombre"`, así que falta el campo.
+3. **`legajo` entero.** Tiene que venir como número JSON entero. Se rechazan el string numérico
+   (`"100200"`), el decimal (`3.7`), el booleano y la notación exponencial.
+4. **`legajo` en rango `1 … 2147483647`.** Cero y negativos no son legajos, y el tope es el máximo
+   de un entero de 32 bits.
+5. **`nombre` string de 1 a 120 caracteres**, ya trimeado.
+6. **`legajo` no registrado**, o `409`.
+
+Reglas que aplican a todo lo anterior:
+
+| Regla | Decisión |
+| :--- | :--- |
+| Espacios en `nombre` | Se hace **trim** de los extremos. Los espacios internos se preservan tal cual: **no** se colapsan. |
+| Largo de `nombre` | Se mide en caracteres sobre el valor ya trimeado (`len()` en Python, `String.length()` en Java). |
+| Campos de más | **Se ignoran** en silencio, incluido un `id` que venga en el cuerpo. |
+| `nombre` duplicado | **Permitido.** Lo único único es el `legajo`. |
+| Cuerpo inválido en `POST /echo` | Mismo `400` `cuerpo JSON inválido` de la regla 1. |
+
+> **Por qué se rechaza el `legajo` como string.** Aceptarlo obliga a las dos apps a coincidir en
+> cómo convierten `"0100200"`, `" 100200 "` y `"1e5"` — tres decisiones más donde divergir, todas
+> invisibles hasta que alguien manda ese cuerpo. Rechazar es una sola regla y da el mismo resultado
+> de los dos lados.
+
+> **Por qué el tope de 2147483647.** Python maneja enteros de precisión ilimitada y Java, con un
+> `int`, desborda en silencio. Sin un tope explícito, un legajo de veinte dígitos se guarda bien
+> por una réplica y se rompe o se trunca en la otra. El límite se elige por el lenguaje más
+> restrictivo de los dos.
+
+> **Por qué los campos de más se ignoran.** Es lo que permite que el contrato crezca sin romper a
+> un cliente viejo: agregar un campo opcional no invalida las peticiones que no lo mandan.
+> Rechazarlos obligaría a las dos apps a mantener idéntica la lista exacta de claves aceptadas.
+
+### Matriz de verificación
+
+Sirve como batería de pruebas y como lo que el equipo verificador puede disparar contra la URL
+pública. Las dos apps tienen que dar exactamente lo mismo.
+
+| Cuerpo del `POST /personas` | Esperado |
+| :--- | :--- |
+| `{"nombre":"Ada Lovelace","legajo":100200}` | `201` |
+| `{"nombre":"  Ada Lovelace  ","legajo":100201}` | `201`, guardado como `"Ada Lovelace"` |
+| `{"nombre":"Ada  Lovelace","legajo":100202}` | `201`, los dos espacios internos se conservan |
+| `{"nombre":"Ada","legajo":100200}` (legajo repetido) | `409` |
+| `{"nombre":"Grace","legajo":100203,"rol":"almirante"}` | `201`, `rol` ignorado |
+| `{"nombre":"Grace","legajo":100204,"id":99}` | `201` con el `id` de la base, no `99` |
+| `{"nombre":"Ada"}` | `400` campos requeridos |
+| `{"legajo":100205}` | `400` campos requeridos |
+| `{"nombre":"","legajo":100206}` | `400` campos requeridos |
+| `{"nombre":"   ","legajo":100207}` | `400` campos requeridos |
+| `{"nombre":null,"legajo":100208}` | `400` campos requeridos |
+| `{"Nombre":"Ada","legajo":100209}` | `400` campos requeridos |
+| `{"nombre":"Ada","legajo":"100210"}` | `400` legajo debe ser numérico |
+| `{"nombre":"Ada","legajo":3.7}` | `400` legajo debe ser numérico |
+| `{"nombre":"Ada","legajo":true}` | `400` legajo debe ser numérico |
+| `{"nombre":"Ada","legajo":0}` | `400` legajo fuera de rango |
+| `{"nombre":"Ada","legajo":-5}` | `400` legajo fuera de rango |
+| `{"nombre":"Ada","legajo":99999999999}` | `400` legajo fuera de rango |
+| `{"nombre":123,"legajo":100211}` | `400` nombre inválido |
+| `{"nombre":"<121 caracteres>","legajo":100212}` | `400` nombre inválido |
+| `{"nombre":"<120 caracteres>","legajo":100213}` | `201` |
+| *(cuerpo vacío)* | `400` cuerpo JSON inválido |
+| `no soy json` | `400` cuerpo JSON inválido |
+| `["Ada",100214]` | `400` cuerpo JSON inválido |
+| `{"nombre":"Ada","legajo":100215}` con Redis caído | `503` |
 
 > **`503` cuando Redis no está.** `/personas` no tiene degradación posible: sin base no hay datos.
 > Devolver `200` con una lista vacía sería peor que fallar, porque el cliente no puede distinguir
@@ -208,19 +302,27 @@ El `id` **lo asigna la base**, nunca la app.
 
 | # | Cambio | Cómo |
 | :--- | :--- | :--- |
-| 1 | `arrancado` sin fracción | `OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS)` |
-| 2 | Agregar `GET /slow` | `Thread.sleep(4000)` y la respuesta de §5 |
-| 3 | Agregar `/personas` | §6 |
-| 4 | Bitácora a disco | §8 |
+| 1 | `equipo` como lista de objetos | §2 — hoy manda `["Agustina", ...]`, van objetos con `nombre`, `apellido` y `legajo` |
+| 2 | `arrancado` sin fracción | `OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS)` |
+| 3 | Agregar `GET /slow` | `Thread.sleep(4000)` y la respuesta de §5 |
+| 4 | Agregar `/personas`, con la validación y el orden de §6 | §6 |
+| 5 | Bitácora a disco | §8 |
 
-Ya cumple sin cambios: **`equipo` como lista de nombres**, `404`
-`{"error":"ruta no encontrada"}`, `405` `{"error":"metodo no permitido"}`, `POST /echo` sin
-`ping` → `400`, variable `HOST_NAME`, puerto default `8080`.
+Ya cumple sin cambios: `404` `{"error":"ruta no encontrada"}`, `405`
+`{"error":"metodo no permitido"}`, `POST /echo` sin `ping` → `400`, variable `HOST_NAME`,
+puerto default `8080`.
 
 ### App Python ✅
 
-Implementado y verificado corriendo las dos apps lado a lado. Pendiente: `/personas` (§6) y la
-bitácora (§8).
+Implementado y verificado corriendo las dos apps lado a lado. Pendiente: la bitácora (§8).
+
+| # | Cambio | Estado |
+| :--- | :--- | :--- |
+| 1 | `equipo` como lista de objetos | ✅ v1.2 |
+| 2 | `arrancado` sin fracción | ✅ |
+| 3 | `GET /slow` | ✅ |
+| 4 | `/personas`, con la validación y el orden de §6 | ✅ v1.3 |
+| 5 | Bitácora a disco | ⬜ |
 
 ---
 
@@ -255,14 +357,18 @@ van apagadas salvo que se acuerde incorporarlas, y ese acuerdo sube la versión 
 
 | Extensión | De quién | Estado |
 | :--- | :--- | :--- |
-| `checksum` (SHA-256 del fuente) en `/` y `/health` | App Python | Apagada por defecto |
+| `checksum` (SHA-256 del fuente) en `/` y `/health` | App Python | **Fuera del contrato — decidido.** Apagada por defecto |
 | Rate limiting por IP con ventana deslizante | App Python | A definir con el grupo |
 
 ### `checksum`
 
 Agrega un campo extra a las respuestas de `/` y `/health` con el SHA-256 del fuente en ejecución,
-para verificar qué versión exacta del código está corriendo cada réplica. Queda detrás de una
-variable:
+para verificar qué versión exacta del código está corriendo cada réplica.
+
+**Queda fuera del contrato.** El campo sólo tendría sentido si las dos apps lo expusieran, y el
+hash del fuente no es comparable entre un `.py` y un `.jar`: no habría forma de contrastar dos
+valores, sólo de mirar cada uno por separado. Sigue disponible como herramienta de diagnóstico de
+App Python, detrás de una variable:
 
 ```bash
 python3 Clase01/app.py 8080                  # respuesta del contrato
@@ -317,3 +423,5 @@ No son parte del contrato entre las apps, pero el balanceador depende de esto:
 | :--- | :--- | :--- |
 | 1.0 | 06/09/2026 | Contrato inicial. Resuelve las ocho divergencias detectadas entre las dos implementaciones y agrega `/personas`, bitácora y rate limiting. |
 | 1.1 | 06/09/2026 | El rate limiting sale del contrato y pasa a §9 como extensión, pendiente de acuerdo con el grupo. Se agrega el `503` de `/personas` cuando la base no responde. |
+| 1.2 | 06/09/2026 | `equipo` pasa a lista de objetos con `nombre`, `apellido` y `legajo` (pedido de la corrección de la Clase 1). `mensaje` se fija como texto plano. El `checksum` queda fuera del contrato de forma definitiva. |
+| 1.3 | 06/09/2026 | `/personas` gana las reglas de validación, el orden en que se aplican, tres códigos de error nuevos (`cuerpo JSON inválido`, `legajo fuera de rango`, `nombre inválido`) y una matriz de casos que sirve de batería de pruebas. |

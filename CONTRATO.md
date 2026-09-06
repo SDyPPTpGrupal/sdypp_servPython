@@ -1,6 +1,6 @@
 # Contrato de servicio — App Java ↔ App Python
 
-**Versión 1.3 — 06/09/2026**
+**Versión 2.0 — 06/09/2026 · gRPC + Protobuf**
 
 Especificación de lo que las dos implementaciones tienen que responder **igual**, para que sean
 intercambiables detrás del balanceador del equipo Plataforma.
@@ -8,12 +8,17 @@ intercambiables detrás del balanceador del equipo Plataforma.
 > **Esto no es una lista de propuestas.** Cada punto está decidido. Si algo hay que cambiar, se
 > cambia sobre este documento y sube la versión — no se resuelve por chat ni se asume distinto de
 > cada lado.
->
-> El motivo es concreto: al comparar las dos implementaciones lado a lado aparecieron ocho
-> divergencias. Un cliente que consume el servicio a través del balanceador recibe respuestas
-> distintas según qué réplica lo atendió, y termina rompiéndose.
 
-**Estado de implementación:** App Python ✅ al día con la v1.3 salvo la bitácora · App Java ⬜ pendiente (ver §7)
+> ⚠️ **La v2.0 es un cambio incompatible.** El servicio deja de hablar HTTP/JSON y pasa a
+> **gRPC sobre HTTP/2 con Protobuf**. Un cliente de la v1.3 no puede hablar con un servidor v2.0.
+> Las consecuencias para los otros dos equipos están en §8 y §11: no son un detalle de
+> implementación, son trabajo que hay que negociar antes de escribir código.
+
+**Estado de implementación:** App Python ⬜ migrando · App Java ⬜ pendiente (ver §8)
+
+El esquema formal vive en **[`contrato.proto`](contrato.proto)**. Este documento especifica lo que
+el `.proto` no puede expresar: validación, orden de los chequeos, semántica de los errores y qué
+hace cada implementación cuando algo falla.
 
 ---
 
@@ -21,141 +26,117 @@ intercambiables detrás del balanceador del equipo Plataforma.
 
 | Regla | Valor |
 | :--- | :--- |
-| Formato | JSON en request y response |
-| Encoding | UTF-8 |
-| `Content-Type` de respuesta | `application/json; charset=utf-8` |
+| Transporte | **gRPC sobre HTTP/2** |
+| Serialización | **Protobuf 3** (`contrato.proto`) |
+| Paquete proto | `sdypp` |
+| Servicio | `sdypp.Servicio` |
+| Canal | **Inseguro** (sin TLS): el cifrado lo pone Tailscale por debajo (ver §11) |
 | Puerto | Primer argumento de línea de comandos; si no, variable `PORT`; default **8080** |
 | Identidad de la instancia | Variable de entorno **`HOST_NAME`** |
-| Nodo donde corre | Variable de entorno **`CASA`** (ej. `casa-tomas`) |
-| Métodos usados | Sólo `GET` y `POST` |
+| Nodo donde corre | Variable de entorno **`CASA`** |
+| Zona horaria | **`America/Argentina/Buenos_Aires`** en las dos implementaciones |
 
-Las claves del JSON van **en el orden en que están especificadas** en este documento. No es un
-requisito técnico —un parser JSON no mira el orden— pero permite comparar dos respuestas a simple
-vista y detectar una divergencia sin herramientas.
+> **La zona horaria es contrato.** Un contenedor sin `tzdata` corre en UTC y
+> devuelve `arrancado` con offset `+00:00`, mientras una instancia fuera de
+> contenedor devuelve `-03:00`: dos réplicas del mismo servicio informando horas
+> distintas. Y como las bitácoras de las tres casas se cruzan entre sí y con la del
+> balanceador, la diferencia deja de ser cosmética. En la imagen se instala
+> `tzdata` y se fija `TZ`.
 
-> **Sobre el puerto.** El default `8080` sirve para desarrollo y para levantar réplicas sin
-> permisos especiales. En el despliegue el puerto real se pasa siempre explícito, como primer
-> argumento o por `PORT`; si ese destino es un puerto privilegiado (<1024), el proceso necesita
-> permisos para hacer el `bind` o falla con `Permission denied`.
+### Qué cambia respecto de la v1.3, y por qué importa
+
+No es sólo "otro formato". Tres cosas dejan de funcionar como antes:
+
+1. **Los nombres de los campos dejan de ser contrato; los números lo son.** En JSON, renombrar
+   `servidoPor` rompía a todos los clientes. En Protobuf lo que viaja es el número de campo, así
+   que renombrar es gratis y **cambiar un número es catastrófico**. Nunca se reutiliza un número
+   liberado.
+2. **Se pierde la distinción entre "ausente" y "vacío".** En proto3 un `string` que no se manda
+   llega como `""` y un `int32` como `0`: no hay forma de saber si el cliente omitió el campo o lo
+   mandó vacío. Media matriz de casos borde de la v1.3 desaparece por esto (§7).
+3. **El tipo hace cumplir parte del contrato.** `legajo` es `int32`: un string numérico o un
+   decimal ya no llegan al servidor, los rechaza el stub. Lo que antes era una regla de validación
+   ahora es un error de compilación del cliente.
 
 ---
 
-## 2. `GET /` — identidad de la instancia
+## 2. `Identidad` — identidad de la instancia
 
-**Respuesta `200`:**
-
-```json
-{
-  "app": "python",
-  "lenguaje": "Python 3.14.7",
-  "equipo": [
-    { "nombre": "Tomás", "apellido": "Resnik", "legajo": 190168 },
-    { "nombre": "Mateo", "apellido": "Nomico", "legajo": 168102 },
-    { "nombre": "Salvador", "apellido": "Baez", "legajo": 195157 }
-  ],
-  "version": 1,
-  "mensaje": "hola mundo python",
-  "host": "casa-tomas",
-  "arrancado": "2026-09-06T12:33:34-03:00"
-}
-```
+`rpc Identidad(Vacio) returns (Instancia)`
 
 | Campo | Tipo | Detalle |
 | :--- | :--- | :--- |
 | `app` | string | `"python"` o `"java"`. Es lo que permite ver qué implementación atendió. |
 | `lenguaje` | string | Texto libre, informativo. |
-| `equipo` | array de objetos | Un objeto por integrante, con `nombre` (string), `apellido` (string) y `legajo` (number). |
-| `version` | number | Entero. Lo que cambia en cada deploy. |
+| `equipo` | repeated Integrante | Un `Integrante` por persona: `nombre`, `apellido`, `legajo`. |
+| `version` | int32 | Lo que cambia en cada deploy. |
 | `mensaje` | string | Texto plano. Lo que cambia en cada deploy. |
 | `host` | string | Valor de `HOST_NAME`. |
 | `arrancado` | string | ISO-8601 con offset, **precisión de segundos, sin fracción**. |
 
-> **`equipo` es una lista de objetos, no de strings.** App Python venía mandando
-> `"Tomás Resnik (Legajo 190168)"` y App Java `"Agustina"`: dos formatos distintos, y el primero
-> obliga a parsear por paréntesis para sacar el legajo. Con un campo por dato no queda nada que
-> parsear y las dos implementaciones mandan la misma estructura.
->
-> El `legajo` es **number**, no string: es el campo por el que un cliente identifica a una persona,
-> y es el mismo tipo que usa `/personas` en §6.
-
-> **`mensaje` es texto plano.** Es el campo que un cliente procesaría de verdad —los demás son
-> metadatos de la instancia—, así que se evaluó darle estructura propia. Se deja plano a
-> propósito: hoy su único uso es hacer visible el cambio de contenido en cada deploy, y una
-> estructura que ningún cliente consume es una forma más de divergir entre las dos apps. Si
-> alguna vez transporta datos, cambia acá y sube la versión del contrato.
-
-> **`arrancado` sin fracción de segundo.** Java devuelve nanosegundos por defecto
-> (`2026-09-06T12:33:34.270495056-03:00`), lo cual no es comparable contra la otra implementación.
-> En Java: `OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString()`.
+> **`arrancado` sigue siendo string.** Protobuf tiene `google.protobuf.Timestamp`, que sería lo
+> correcto, pero obliga a importar el well-known type en las dos implementaciones y a decidir cómo
+> se muestra. Se deja como string ISO-8601 para que el valor sea idéntico al de la v1.3 y la
+> comparación entre las dos apps siga siendo a simple vista. **Java:**
+> `OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString()`.
 
 ---
 
-## 3. `GET /health` — chequeo de salud
+## 3. `Salud` — chequeo de salud
 
-**Respuesta `200`:**
+`rpc Salud(Vacio) returns (EstadoSalud)` → `status: "ok"`, `app`, `version`.
 
-```json
-{ "status": "ok", "app": "python", "version": 1 }
-```
+Cualquier respuesta que no sea `OK` significa que la instancia no está sana.
 
-Es lo que consulta el balanceador para decidir si la instancia sigue en rotación. Cualquier
-respuesta distinta de `200` significa que la instancia no está sana.
-
----
-
-## 4. `POST /echo`
-
-**Request:** `{"ping": "algo"}`
-
-**Respuesta `200`:**
-
-```json
-{ "pong": "algo", "servidoPor": "python", "version": 1 }
-```
-
-**Si falta el campo `ping`** (o el cuerpo viene vacío): `400` con
-`{"error": "se requiere el campo ping"}`.
-
-> Antes App Python devolvía `200` con `{"pong": ""}` y App Java `400`. Se adopta el `400`: una
-> petición sin el campo obligatorio es inválida, no una petición con valor vacío.
+> **Además hay que exponer `grpc.health.v1.Health`**, el health checking estándar de gRPC. Es lo
+> que entienden las herramientas (`grpc_health_probe`, el `HEALTHCHECK` del contenedor, los
+> balanceadores). `Salud` es el equivalente del `/health` de la v1.3 y lleva `app` y `version`,
+> que el estándar no tiene; el estándar es lo que consultan las máquinas. Se implementan los dos.
 
 ---
 
-## 5. `GET /slow` — petición lenta
+## 4. `Echo`
 
-Duerme **4 segundos** y responde `200`:
+`rpc Echo(PingPedido) returns (PongRespuesta)`
 
-```json
-{
-  "status": "ok",
-  "mensaje": "...",
-  "app": "python",
-  "version": 1
-}
-```
+Devuelve `pong` con el valor recibido, más `servido_por` y `version`.
 
-Entra al contrato porque hace falta para validar dos comportamientos del sistema:
+**Si `ping` viene vacío:** `INVALID_ARGUMENT` con el mensaje `se requiere el campo ping`.
 
-1. **Graceful shutdown:** verificar que una petición en vuelo se completa aunque el proceso reciba
-   `SIGTERM`.
-2. **Deploy sin downtime:** mantener tráfico en curso durante el blue-green y comprobar que no se
-   pierde ninguna petición.
-
-Si sólo una de las dos apps la expone, la ruta devuelve `200` o `404` según a qué réplica derive
-el balanceador.
+> En proto3 no se puede distinguir "no mandó `ping`" de "mandó `ping` vacío": los dos llegan como
+> `""`. El contrato se apoya en eso y trata a los dos igual, que es lo que la v1.3 ya hacía por
+> decisión propia.
 
 ---
 
-## 6. `/personas` — estado compartido
+## 5. `Lenta` — petición lenta
+
+`rpc Lenta(Vacio) returns (RespuestaLenta)`. Duerme **4 segundos** y responde `status: "ok"`.
+
+Sirve para validar dos comportamientos:
+
+1. **Graceful shutdown:** que un RPC en vuelo se complete aunque el proceso reciba `SIGTERM`.
+   En gRPC esto es `server.stop(grace)`, que deja de aceptar RPCs nuevos y espera a los en curso.
+2. **Deploy sin downtime:** mantener tráfico en curso durante el blue-green.
+
+---
+
+## 6. `ListarPersonas` — estado compartido
+
+`rpc ListarPersonas(Vacio) returns (ListaPersonas)`
+
+Devuelve `servido_por` y las personas **ordenadas por `id` ascendente**. Sin personas cargadas
+devuelve la lista vacía, no un error.
+
+**Si la base no responde:** `UNAVAILABLE` con el mensaje `base de datos no disponible`.
+
+### Motor: **Redis**, en un contenedor
 
 Las dos apps leen y escriben sobre **la misma base**. El estado sale de las instancias, que quedan
 *stateless* y por lo tanto reemplazables entre sí.
 
-### Motor: **Redis**
-
-Su `INCR` es atómico: garantiza que dos réplicas dando de alta al mismo tiempo no se pisen los
-`id` sin necesidad de coordinarse entre ellas. `SETNX` da la misma garantía para detectar legajos
-duplicados. Sin esa atomicidad haría falta un mecanismo de exclusión mutua entre casas, que es un
+`INCR` es atómico: garantiza que dos réplicas dando de alta al mismo tiempo no se pisen los `id`
+sin necesidad de coordinarse. Sin esa atomicidad haría falta exclusión mutua entre casas, que es un
 problema bastante más grande que el que resuelve.
 
 | Clave | Tipo | Contenido |
@@ -163,265 +144,208 @@ problema bastante más grande que el que resuelve.
 | `personas:seq` | string | Contador. `INCR` devuelve el `id` de la próxima persona. |
 | `persona:<id>` | hash | `nombre`, `legajo` |
 | `personas:index` | sorted set | miembro `<id>`, score `<id>` — mantiene el orden de listado |
-| `legajo:<legajo>` | string | `<id>`. Se crea con `SETNX` para detectar duplicados. |
+| `legajo:<legajo>` | string | `<id>`. Se crea de forma atómica para detectar duplicados. |
 
-La URL de conexión llega por la variable de entorno **`TP_REDIS_URL`**. Lleva la contraseña
-adentro, así que **no se versiona**: va en el `.env` de cada nodo, que está en el `.gitignore`.
+**El esquema de claves es contrato tanto como el `.proto`.** Si una implementación guardara la
+misma persona bajo otra clave o con otra estructura, las dos apps escribirían en la misma base sin
+encontrar lo del otro.
 
-### `GET /personas` → `200`
+La URL de conexión llega por **`TP_REDIS_URL`**. Lleva la contraseña adentro, así que **no se
+versiona**: va en el `.env` de cada nodo, que está en el `.gitignore`.
 
-```json
-{
-  "servidoPor": "python",
-  "personas": [
-    { "id": 1, "nombre": "Ada Lovelace", "legajo": 100200 }
-  ]
-}
-```
+---
 
-- Ordenadas por **`id` ascendente** (`ZRANGE personas:index 0 -1`). Sin un orden fijo, dos réplicas
-  devuelven el mismo conjunto en distinta secuencia y el servicio parece comportarse de forma
-  errática.
-- Sin personas cargadas: `200` con `"personas": []`. **No** es `404`.
-- `nombre` es el **nombre completo en un solo campo**, a diferencia del `equipo` de §2, que separa
-  `nombre` y `apellido`. La asimetría es deliberada: el `equipo` es un dato fijo del contrato, que
-  las dos apps escriben a mano y del que se conoce el legajo; una persona es un dato que carga el
-  cliente, y partirlo en dos campos obliga a decidir qué pasa con los nombres compuestos. Si el
-  grupo prefiere unificar las dos formas, se cambia acá y sube la versión.
+## 7. `CrearPersona` — alta
 
-### `POST /personas`
+`rpc CrearPersona(NuevaPersona) returns (RespuestaPersona)`
 
-**Request:** `{"nombre": "Ada Lovelace", "legajo": 100200}`
+Devuelve `servido_por` y la `Persona` creada. **El `id` lo asigna la base**, nunca la app.
 
-**Respuesta `201`:**
-
-```json
-{ "servidoPor": "python", "id": 1, "nombre": "Ada Lovelace", "legajo": 100200 }
-```
-
-| Situación | Código | Cuerpo |
+| Situación | Código gRPC | Mensaje |
 | :--- | :--- | :--- |
-| Alta correcta | `201` | la persona creada + `servidoPor` |
-| Cuerpo ausente, no parseable como JSON, o que no es un objeto | `400` | `{"error": "cuerpo JSON inválido"}` |
-| Falta `nombre` o falta `legajo` | `400` | `{"error": "se requieren los campos nombre y legajo"}` |
-| `legajo` no es un entero | `400` | `{"error": "legajo debe ser numérico"}` |
-| `legajo` entero pero fuera de rango | `400` | `{"error": "legajo fuera de rango"}` |
-| `nombre` no es string, o supera los 120 caracteres | `400` | `{"error": "nombre inválido"}` |
-| `legajo` ya registrado | `409` | `{"error": "el legajo ya está registrado"}` |
-| La base no responde | `503` | `{"error": "base de datos no disponible"}` |
+| Alta correcta | `OK` | — |
+| `nombre` vacío o sólo espacios | `INVALID_ARGUMENT` | `se requieren los campos nombre y legajo` |
+| `legajo` fuera de `1 … 2147483647` | `INVALID_ARGUMENT` | `legajo fuera de rango` |
+| `nombre` de más de 120 caracteres | `INVALID_ARGUMENT` | `nombre inválido` |
+| `legajo` ya registrado | `ALREADY_EXISTS` | `el legajo ya está registrado` |
+| La base no responde | `UNAVAILABLE` | `base de datos no disponible` |
 
-El `id` **lo asigna la base**, nunca la app.
+### Validación: reglas y orden
 
-### Validación: reglas y casos borde
-
-Las dos apps validan **igual** y en **este orden**. El orden es parte del contrato: ante un cuerpo
-con dos problemas a la vez, las dos tienen que devolver el mismo error, no cada una el que detectó
+Las dos apps validan **igual** y en **este orden**. El orden es parte del contrato: ante un mensaje
+con dos problemas a la vez, las dos tienen que devolver el mismo error y no cada una el que detectó
 primero.
 
-1. **El cuerpo tiene que ser un objeto JSON.** Vacío, texto suelto, un array o un escalar → `400`
-   `cuerpo JSON inválido`. **No se exige `Content-Type: application/json`**: se parsea el cuerpo
-   venga con el header que venga. (Un `curl -d` manda `application/x-www-form-urlencoded` por
-   defecto, y perder la demo por eso sería absurdo.)
-2. **Presencia de `nombre` y `legajo`.** Cuenta como ausente: la clave que no está, la que vale
-   `null`, y un `nombre` que queda vacío después del trim. Las claves son **case-sensitive**:
-   `"Nombre"` no es `"nombre"`, así que falta el campo.
-3. **`legajo` entero.** Tiene que venir como número JSON entero. Se rechazan el string numérico
-   (`"100200"`), el decimal (`3.7`), el booleano y la notación exponencial.
-4. **`legajo` en rango `1 … 2147483647`.** Cero y negativos no son legajos, y el tope es el máximo
-   de un entero de 32 bits.
-5. **`nombre` string de 1 a 120 caracteres**, ya trimeado.
-6. **`legajo` no registrado**, o `409`.
-
-Reglas que aplican a todo lo anterior:
+1. **`nombre` presente**, después del trim. Vacío o sólo espacios → `INVALID_ARGUMENT`. En proto3
+   esto cubre también el caso de no mandarlo.
+2. **`legajo` en rango `1 … 2147483647`.** El `0` cae acá, y en proto3 el `0` es también lo que
+   llega cuando el campo no se manda: los dos casos dan el mismo error, que es lo que se quiere.
+3. **`nombre` de 1 a 120 caracteres**, medido sobre el valor ya trimeado.
+4. **`legajo` no registrado**, o `ALREADY_EXISTS`.
 
 | Regla | Decisión |
 | :--- | :--- |
-| Espacios en `nombre` | Se hace **trim** de los extremos. Los espacios internos se preservan tal cual: **no** se colapsan. |
-| Largo de `nombre` | Se mide en caracteres sobre el valor ya trimeado (`len()` en Python, `String.length()` en Java). |
-| Campos de más | **Se ignoran** en silencio, incluido un `id` que venga en el cuerpo. |
+| Espacios en `nombre` | **Trim** de los extremos. Los internos se preservan: **no** se colapsan. |
+| Largo de `nombre` | Caracteres sobre el valor trimeado (`len()` en Python, `String.length()` en Java). |
+| Campos desconocidos | Protobuf los ignora y los preserva. No hay nada que decidir. |
 | `nombre` duplicado | **Permitido.** Lo único único es el `legajo`. |
-| Cuerpo inválido en `POST /echo` | Mismo `400` `cuerpo JSON inválido` de la regla 1. |
 
-> **Por qué se rechaza el `legajo` como string.** Aceptarlo obliga a las dos apps a coincidir en
-> cómo convierten `"0100200"`, `" 100200 "` y `"1e5"` — tres decisiones más donde divergir, todas
-> invisibles hasta que alguien manda ese cuerpo. Rechazar es una sola regla y da el mismo resultado
-> de los dos lados.
-
-> **Por qué el tope de 2147483647.** Python maneja enteros de precisión ilimitada y Java, con un
-> `int`, desborda en silencio. Sin un tope explícito, un legajo de veinte dígitos se guarda bien
-> por una réplica y se rompe o se trunca en la otra. El límite se elige por el lenguaje más
-> restrictivo de los dos.
-
-> **Por qué los campos de más se ignoran.** Es lo que permite que el contrato crezca sin romper a
-> un cliente viejo: agregar un campo opcional no invalida las peticiones que no lo mandan.
-> Rechazarlos obligaría a las dos apps a mantener idéntica la lista exacta de claves aceptadas.
+> **El tope de `int32` ahora lo impone el tipo.** En la v1.3 había que validar a mano que el legajo
+> entrara en un `int` de Java; con Protobuf, `int32` es el tipo del campo y el desborde lo rechaza
+> el stub del cliente antes de salir a la red. La validación de rango queda igual para cubrir el
+> `0` y los negativos.
 
 ### Matriz de verificación
 
-Sirve como batería de pruebas y como lo que el equipo verificador puede disparar contra la URL
-pública. Las dos apps tienen que dar exactamente lo mismo.
+Se achicó a la mitad respecto de la v1.3: **el tipado eliminó los casos que antes había que
+validar a mano**. Los que quedan son los que el tipo no puede expresar.
 
-| Cuerpo del `POST /personas` | Esperado |
+| `NuevaPersona` | Esperado |
 | :--- | :--- |
-| `{"nombre":"Ada Lovelace","legajo":100200}` | `201` |
-| `{"nombre":"  Ada Lovelace  ","legajo":100201}` | `201`, guardado como `"Ada Lovelace"` |
-| `{"nombre":"Ada  Lovelace","legajo":100202}` | `201`, los dos espacios internos se conservan |
-| `{"nombre":"Ada","legajo":100200}` (legajo repetido) | `409` |
-| `{"nombre":"Grace","legajo":100203,"rol":"almirante"}` | `201`, `rol` ignorado |
-| `{"nombre":"Grace","legajo":100204,"id":99}` | `201` con el `id` de la base, no `99` |
-| `{"nombre":"Ada"}` | `400` campos requeridos |
-| `{"legajo":100205}` | `400` campos requeridos |
-| `{"nombre":"","legajo":100206}` | `400` campos requeridos |
-| `{"nombre":"   ","legajo":100207}` | `400` campos requeridos |
-| `{"nombre":null,"legajo":100208}` | `400` campos requeridos |
-| `{"Nombre":"Ada","legajo":100209}` | `400` campos requeridos |
-| `{"nombre":"Ada","legajo":"100210"}` | `400` legajo debe ser numérico |
-| `{"nombre":"Ada","legajo":3.7}` | `400` legajo debe ser numérico |
-| `{"nombre":"Ada","legajo":true}` | `400` legajo debe ser numérico |
-| `{"nombre":"Ada","legajo":0}` | `400` legajo fuera de rango |
-| `{"nombre":"Ada","legajo":-5}` | `400` legajo fuera de rango |
-| `{"nombre":"Ada","legajo":99999999999}` | `400` legajo fuera de rango |
-| `{"nombre":123,"legajo":100211}` | `400` nombre inválido |
-| `{"nombre":"<121 caracteres>","legajo":100212}` | `400` nombre inválido |
-| `{"nombre":"<120 caracteres>","legajo":100213}` | `201` |
-| *(cuerpo vacío)* | `400` cuerpo JSON inválido |
-| `no soy json` | `400` cuerpo JSON inválido |
-| `["Ada",100214]` | `400` cuerpo JSON inválido |
-| `{"nombre":"Ada","legajo":100215}` con Redis caído | `503` |
+| `nombre:"Ada Lovelace" legajo:100200` | `OK` |
+| `nombre:"  Ada Lovelace  " legajo:100201` | `OK`, guardado como `"Ada Lovelace"` |
+| `nombre:"Ada  Lovelace" legajo:100202` | `OK`, los dos espacios internos se conservan |
+| `nombre:"Ada" legajo:100200` (repetido) | `ALREADY_EXISTS` |
+| `nombre:"" legajo:100206` | `INVALID_ARGUMENT` campos requeridos |
+| `nombre:"   " legajo:100207` | `INVALID_ARGUMENT` campos requeridos |
+| *(sin `nombre`)* `legajo:100205` | `INVALID_ARGUMENT` campos requeridos |
+| `nombre:"Ada"` *(sin `legajo`)* | `INVALID_ARGUMENT` legajo fuera de rango |
+| `nombre:"Ada" legajo:0` | `INVALID_ARGUMENT` legajo fuera de rango |
+| `nombre:"Ada" legajo:-5` | `INVALID_ARGUMENT` legajo fuera de rango |
+| `nombre:<121 caracteres> legajo:100212` | `INVALID_ARGUMENT` nombre inválido |
+| `nombre:<120 caracteres> legajo:100213` | `OK` |
+| cualquiera, con Redis caído | `UNAVAILABLE` |
 
-> **`503` cuando Redis no está.** `/personas` no tiene degradación posible: sin base no hay datos.
-> Devolver `200` con una lista vacía sería peor que fallar, porque el cliente no puede distinguir
-> "no hay personas cargadas" de "no pude leerlas". Las demás rutas (`/`, `/health`, `/echo`,
-> `/slow`) siguen respondiendo normal: no dependen de la base.
+**Casos de la v1.3 que ya no existen:** legajo como string, legajo decimal, legajo booleano,
+notación exponencial, legajo mayor a int32, `nombre` no string, clave con mayúscula distinta,
+cuerpo no-JSON, cuerpo que es un array, cuerpo vacío. Trece casos borrados por el tipado — es el
+argumento más fuerte a favor de este cambio, y va en el informe.
 
 ---
 
-## 7. Qué tiene que cambiar cada equipo
+## 8. Qué tiene que cambiar cada equipo
 
 ### App Java ⬜
 
-| # | Cambio | Cómo |
-| :--- | :--- | :--- |
-| 1 | `equipo` como lista de objetos | §2 — hoy manda `["Agustina", ...]`, van objetos con `nombre`, `apellido` y `legajo` |
-| 2 | `arrancado` sin fracción | `OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS)` |
-| 3 | Agregar `GET /slow` | `Thread.sleep(4000)` y la respuesta de §5 |
-| 4 | Agregar `/personas`, con la validación y el orden de §6 | §6 |
-| 5 | Bitácora a disco | §8 |
+| # | Cambio |
+| :--- | :--- |
+| 1 | Generar los stubs desde `contrato.proto` (`protoc` + `grpc-java`) |
+| 2 | Reemplazar el servidor HTTP por un servidor gRPC |
+| 3 | Los seis RPC de §2 a §7 |
+| 4 | `grpc.health.v1.Health` además de `Salud` (§3) |
+| 5 | `/personas` sobre Redis con el esquema de §6 y la validación de §7 |
+| 6 | Bitácora a disco (§9) |
+| 7 | Contenedor (§10) |
 
-Ya cumple sin cambios: `404` `{"error":"ruta no encontrada"}`, `405`
-`{"error":"metodo no permitido"}`, `POST /echo` sin `ping` → `400`, variable `HOST_NAME`,
-puerto default `8080`.
+**Es una reescritura, no un ajuste.** El servidor HTTP no se reusa.
 
-### App Python ✅
-
-Implementado y verificado corriendo las dos apps lado a lado. Pendiente: la bitácora (§8).
+### App Python ⬜
 
 | # | Cambio | Estado |
 | :--- | :--- | :--- |
-| 1 | `equipo` como lista de objetos | ✅ v1.2 |
-| 2 | `arrancado` sin fracción | ✅ |
-| 3 | `GET /slow` | ✅ |
-| 4 | `/personas`, con la validación y el orden de §6 | ✅ v1.3 |
-| 5 | Bitácora a disco | ⬜ |
+| 1 | Stubs desde `contrato.proto` | ⬜ |
+| 2 | Servidor gRPC en lugar del HTTP | ⬜ |
+| 3 | Los seis RPC | ⬜ |
+| 4 | `grpc.health.v1.Health` | ⬜ |
+| 5 | Validación y repositorio | ✅ se reusan tal cual: no dependen del transporte |
+| 6 | Bitácora | ⬜ |
+| 7 | Contenedor | ⬜ |
 
 ---
 
-## 8. Bitácora a disco
+## 9. Bitácora a disco
 
-Cada instancia escribe **una línea por operación atendida**, en un archivo del disco local del
-nodo donde corre. Formato idéntico en las dos implementaciones:
+Cada instancia escribe **una línea por RPC atendido**, en el disco local del nodo donde corre —
+no en la base. Formato idéntico en las dos implementaciones:
 
 ```
-2026-09-08T14:03:22-03:00 | java@casa-agustina | POST /personas | 201 | id=7
+2026-09-08T14:03:22-03:00 | java@casa-agustina | CrearPersona | OK | id=7
 ```
 
 | Campo | Contenido |
 | :--- | :--- |
 | 1 | Timestamp ISO-8601 con offset, precisión de segundos |
 | 2 | `<app>@<CASA>`, de las variables de entorno |
-| 3 | Método y ruta |
-| 4 | Código HTTP de la respuesta |
+| 3 | **Nombre del RPC** (antes era método y ruta) |
+| 4 | **Código gRPC** de la respuesta (`OK`, `INVALID_ARGUMENT`, …) |
 | 5 | `id=<n>` si la operación involucra una persona; `-` en cualquier otro caso |
 
-El objetivo es poder cruzar el log del balanceador con el de cada nodo y auditar una operación
-puntual: el balanceador registra a quién derivó, el nodo registra qué hizo.
+**Un archivo por réplica** (`bitacora-<HOST_NAME>.log`): dos réplicas en el mismo nodo escribiendo
+el mismo archivo no se pueden distinguir después, y distinguirlas es justo lo que la auditoría de
+la Etapa 2 tiene que demostrar.
+
+El objetivo es cruzar el log del balanceador con el de cada nodo: él registra a quién derivó, el
+nodo registra qué hizo.
 
 ---
 
-## 9. Fuera del contrato
+## 10. El servicio corre en contenedores
 
-Extensiones que hoy implementa una sola de las dos apps. **No son obligatorias.** Mientras el
-balanceador reparta entre implementaciones distintas, una extensión activa hace que el servicio
-se comporte distinto según quién atendió — que es exactamente lo que este documento evita. Por eso
-van apagadas salvo que se acuerde incorporarlas, y ese acuerdo sube la versión del contrato.
+Cada réplica es un contenedor. La base es otro.
 
-| Extensión | De quién | Estado |
-| :--- | :--- | :--- |
-| `checksum` (SHA-256 del fuente) en `/` y `/health` | App Python | **Fuera del contrato — decidido.** Apagada por defecto |
-| Rate limiting por IP con ventana deslizante | App Python | A definir con el grupo |
+| Regla | Valor |
+| :--- | :--- |
+| Puerto dentro del contenedor | `8080` |
+| Variables obligatorias | `HOST_NAME`, `CASA`, `TP_REDIS_URL` |
+| Usuario | **no-root** |
+| `HEALTHCHECK` | contra `grpc.health.v1.Health`, no con `curl` (no hay HTTP que consultar) |
+| Apagado | el contenedor recibe `SIGTERM`; el proceso tiene que hacer `server.stop(grace)` y no morir de golpe |
 
-### `checksum`
-
-Agrega un campo extra a las respuestas de `/` y `/health` con el SHA-256 del fuente en ejecución,
-para verificar qué versión exacta del código está corriendo cada réplica.
-
-**Queda fuera del contrato.** El campo sólo tendría sentido si las dos apps lo expusieran, y el
-hash del fuente no es comparable entre un `.py` y un `.jar`: no habría forma de contrastar dos
-valores, sólo de mirar cada uno por separado. Sigue disponible como herramienta de diagnóstico de
-App Python, detrás de una variable:
-
-```bash
-python3 Clase01/app.py 8080                  # respuesta del contrato
-TP_CHECKSUM=on python3 Clase01/app.py 8080   # con el checksum expuesto
-```
-
-### Rate limiting
-
-Limita las peticiones por IP en una ventana deslizante y devuelve `429` al superar el límite.
-
-| Parámetro | Variable | Default |
-| :--- | :--- | :--- |
-| Máximo de peticiones | `TP_RATE_LIMIT_MAX` | `100` |
-| Ventana en segundos | `TP_RATE_LIMIT_WINDOW` | `60` |
-| Contador compartido | `TP_REDIS_URL` | vacío → contador local por réplica |
-
-Si el grupo decide incorporarlo al contrato, hay tres cosas que tienen que quedar cerradas al
-mismo tiempo:
-
-1. **App Java lo implementa también.** Si no, el límite se aplica sólo a una parte de las réplicas
-   y el comportamiento del servicio depende de a quién derivó el balanceador.
-2. **El contador va en Redis.** En memoria, cada réplica lleva su propia cuenta y el límite
-   efectivo se multiplica por la cantidad de réplicas.
-3. **El cliente se identifica por `X-Forwarded-For`** (§10). Detrás del balanceador, todas las
-   peticiones llegan con la misma IP de origen: sin esa cabecera el límite se aplicaría a todos
-   los clientes en conjunto, como si fueran uno solo.
-
-Y una consecuencia para Plataforma: con `100/60s`, el health check no puede consultar más de una
-vez por segundo por instancia. Si chequea más seguido recibe `429`, interpreta que la instancia
-está caída y **saca de rotación réplicas sanas**.
+El `stop_grace_period` del contenedor tiene que ser **mayor que los 4 s de `Lenta`**, o Docker
+manda `SIGKILL` en medio del drenado y el graceful shutdown no sirve de nada.
 
 ---
 
-## 10. Requisitos para el equipo Plataforma
+## 11. Requisitos para el equipo Plataforma
 
-No son parte del contrato entre las apps, pero el balanceador depende de esto:
+⚠️ **Estos requisitos cambiaron por completo con la v2.0.** No son ajustes: son condiciones sin
+las cuales el balanceador no puede reenviar tráfico.
 
-1. **Propagar `X-Forwarded-For`** con la IP del cliente original. Hoy ninguna ruta del contrato la
-   usa, pero sin esa cabecera las apps no tienen forma de saber quién es el cliente real: todo
-   llega con la IP del balanceador. Es la condición para cualquier control o registro por cliente
-   —el rate limiting de §9 entre ellos— y agregarla después es más caro que dejarla desde el
-   principio.
-2. **Definir qué considera "instancia sana".** Si alcanza con `200` en `/health` o si el chequeo
-   también tiene que verificar la base. Una instancia puede responder `200` en `/health` y `503`
-   en `/personas`: un health check superficial no la saca de rotación.
+1. **El balanceador tiene que hablar HTTP/2.** gRPC no viaja sobre HTTP/1.1. Un proxy que lee una
+   request, elige backend y la reenvía con una librería HTTP/1.1 **no funciona con gRPC**. Las
+   salidas son dos:
+   - **Proxy de nivel 4 (TCP):** reenviar bytes sin entender el protocolo. Es el camino corto, pero
+     pierde la capacidad de ver qué RPC pasó — y con eso se cae el requisito del enunciado de que
+     el balanceador loguee a quién derivó cada operación con detalle.
+   - **Proxy gRPC real:** entender HTTP/2 y multiplexar streams. Es bastante más que las "menos de
+     cien líneas" que el enunciado estima para el balanceador.
+2. **El health check tiene que llamar a `grpc.health.v1.Health`**, no hacer un GET.
+3. **Una conexión gRPC es persistente y multiplexada.** No hay una conexión por request: el cliente
+   abre un canal y lo reusa. El balanceo por request deja de ser gratis — si reparte por conexión,
+   un cliente queda pegado a una réplica para siempre y el reparto no se ve en la demo.
+4. **La IP del cliente y el id de correlación viajan como metadata gRPC**, no como cabeceras HTTP:
+   `x-forwarded-for` y `x-request-id` en minúscula, que es como gRPC normaliza las claves.
+5. **ngrok:** el túnel HTTP del plan free no sirve para gRPC sin TLS end-to-end. Hay que exponer el
+   balanceador por el **túnel TCP**, y el cliente conectarse a ese host:puerto.
+6. **El verificador del equipo cruzado necesita un cliente gRPC.** Ya no puede ser un `curl` en un
+   `while`: hay que darles los stubs o un binario. Esto hay que avisarlo antes de la demo.
 
 ---
 
-## 11. Registro de versiones
+## 12. Registro de versiones
 
 | Versión | Fecha | Cambios |
 | :--- | :--- | :--- |
-| 1.0 | 06/09/2026 | Contrato inicial. Resuelve las ocho divergencias detectadas entre las dos implementaciones y agrega `/personas`, bitácora y rate limiting. |
-| 1.1 | 06/09/2026 | El rate limiting sale del contrato y pasa a §9 como extensión, pendiente de acuerdo con el grupo. Se agrega el `503` de `/personas` cuando la base no responde. |
-| 1.2 | 06/09/2026 | `equipo` pasa a lista de objetos con `nombre`, `apellido` y `legajo` (pedido de la corrección de la Clase 1). `mensaje` se fija como texto plano. El `checksum` queda fuera del contrato de forma definitiva. |
-| 1.3 | 06/09/2026 | `/personas` gana las reglas de validación, el orden en que se aplican, tres códigos de error nuevos (`cuerpo JSON inválido`, `legajo fuera de rango`, `nombre inválido`) y una matriz de casos que sirve de batería de pruebas. |
+| 1.0 | 06/09/2026 | Contrato inicial sobre HTTP/JSON. Resuelve las ocho divergencias detectadas entre las dos implementaciones y agrega `/personas`, bitácora y rate limiting. |
+| 1.1 | 06/09/2026 | El rate limiting sale del contrato y pasa a extensión. Se agrega el `503` de `/personas`. |
+| 1.2 | 06/09/2026 | `equipo` pasa a lista de objetos con `nombre`, `apellido` y `legajo`. `mensaje` se fija como texto plano. El `checksum` queda fuera del contrato. |
+| 1.3 | 06/09/2026 | `/personas` gana las reglas de validación, el orden en que se aplican y una matriz de casos borde. |
+| **2.0** | **06/09/2026** | **Cambio incompatible: el transporte pasa de HTTP/JSON a gRPC sobre HTTP/2 con Protobuf.** El esquema formal se muda a `contrato.proto`. Los códigos HTTP se reemplazan por códigos de estado gRPC. Trece casos borde desaparecen porque el tipado los hace imposibles. Se agrega `grpc.health.v1.Health`, el despliegue en contenedores (§10) y los requisitos nuevos de Plataforma (§11). |
+
+---
+
+## 13. Fuera del contrato
+
+Extensiones que implementa una sola de las dos apps. **No son obligatorias** y van apagadas: con el
+balanceador repartiendo, una extensión activa hace que el servicio se comporte distinto según quién
+atendió.
+
+| Extensión | De quién | Estado |
+| :--- | :--- | :--- |
+| `checksum` (SHA-256 del fuente) | App Python | Fuera del contrato — decidido. `TP_CHECKSUM` |
+| Rate limiting por cliente | App Python | A definir con el grupo. `TP_RATE_LIMIT` |
+
+En gRPC las dos se implementan como **interceptores**, no como código dentro de cada método. El
+rate limiting, si entra al contrato, necesita las tres condiciones de siempre: que Java lo
+implemente igual, que el contador viva en Redis, y que el cliente se identifique por la metadata
+`x-forwarded-for` (§11.4).

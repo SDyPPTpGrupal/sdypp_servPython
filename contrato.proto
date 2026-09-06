@@ -1,5 +1,5 @@
 // Contrato de servicio — App Java <-> App Python
-// Versión 2.1. Ver CONTRATO.md para las reglas que el .proto no puede expresar
+// Versión 2.2. Ver CONTRATO.md para las reglas que el .proto no puede expresar
 // (validación, orden de los chequeos, semántica de los errores).
 //
 // Generar los stubs:
@@ -13,26 +13,33 @@ package sdypp;
 option java_package = "ar.edu.unlu.sdypp.contrato";
 option java_multiple_files = true;
 
-// El servicio completo. Las dos implementaciones exponen estos seis métodos con
+// El servicio completo. Las dos implementaciones exponen estos cinco métodos con
 // estas mismas firmas: son intercambiables detrás del balanceador.
 service Servicio {
   // Identidad de la instancia. Reemplaza a GET /
-  rpc Identidad(Vacio) returns (Instancia);
+  rpc Identidad(IdentidadPedido) returns (Instancia);
 
   // Chequeo de salud. Reemplaza a GET /health
-  rpc Salud(Vacio) returns (EstadoSalud);
+  rpc Salud(SaludPedido) returns (EstadoSalud);
 
   // Reemplaza a POST /echo
   rpc Echo(PingPedido) returns (PongRespuesta);
 
   // Reemplaza a GET /personas
-  rpc ListarPersonas(Vacio) returns (ListaPersonas);
+  rpc ListarPersonas(ListarPersonasPedido) returns (ListaPersonas);
 
   // Reemplaza a POST /personas
   rpc CrearPersona(NuevaPersona) returns (RespuestaPersona);
 }
 
-message Vacio {}
+// Un mensaje de pedido propio por método, aunque hoy los tres estén vacíos. Si se
+// compartiera uno solo, el día que ListarPersonas necesite un filtro o paginación
+// el campo nuevo aparecería también en Identidad y en Salud.
+message IdentidadPedido {}
+
+message SaludPedido {}
+
+message ListarPersonasPedido {}
 
 // Un integrante del equipo. El legajo es un campo propio, no un dato embutido en
 // el nombre: acá el tipo lo hace imposible de otra forma.
@@ -53,7 +60,15 @@ message Instancia {
 }
 
 message EstadoSalud {
-  string status = 1;     // "ok"
+  // Enumerado y no string: con texto libre una implementación puede mandar "ok" y
+  // la otra "OK", que es justo la clase de divergencia que este contrato evita.
+  // El valor 0 es obligatorio en proto3 y es el que llega si el campo no se manda.
+  enum Estado {
+    ESTADO_NO_ESPECIFICADO = 0;
+    SANO = 1;
+  }
+
+  Estado status = 1;
   string app = 2;
   int32 version = 3;
 }

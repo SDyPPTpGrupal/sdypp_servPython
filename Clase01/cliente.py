@@ -1,4 +1,4 @@
-"""Cliente de línea de comandos del contrato v2.1.
+"""Cliente de línea de comandos del contrato v2.2.
 
 Con gRPC ya no alcanza un `curl`: el cliente necesita los stubs. Esto es lo mínimo
 para poder probar una réplica a mano y para la demo.
@@ -34,13 +34,13 @@ def main():
         stub = pb_grpc.ServicioStub(canal)
         try:
             if operacion == "identidad":
-                respuesta = stub.Identidad(pb.Vacio(), timeout=5)
+                respuesta = stub.Identidad(pb.IdentidadPedido(), timeout=5)
             elif operacion == "salud":
-                respuesta = stub.Salud(pb.Vacio(), timeout=5)
+                respuesta = stub.Salud(pb.SaludPedido(), timeout=5)
             elif operacion == "echo":
                 respuesta = stub.Echo(pb.PingPedido(ping=argumentos[0] if argumentos else ""), timeout=5)
             elif operacion == "personas":
-                respuesta = stub.ListarPersonas(pb.Vacio(), timeout=5)
+                respuesta = stub.ListarPersonas(pb.ListarPersonasPedido(), timeout=5)
             elif operacion == "alta":
                 if len(argumentos) < 2:
                     print("alta necesita nombre y legajo")

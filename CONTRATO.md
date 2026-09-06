@@ -1,6 +1,6 @@
 # Contrato de servicio — App Java ↔ App Python
 
-**Versión 2.1 — 06/09/2026 · gRPC + Protobuf**
+**Versión 2.2 — 06/09/2026 · gRPC + Protobuf**
 
 Especificación de lo que las dos implementaciones tienen que responder **igual**, para que sean
 intercambiables detrás del balanceador del equipo Plataforma.
@@ -14,7 +14,7 @@ intercambiables detrás del balanceador del equipo Plataforma.
 > Las consecuencias para los otros dos equipos están en §7 y §10: no son un detalle de
 > implementación, son trabajo que hay que negociar antes de escribir código.
 
-**Estado de implementación:** App Python ✅ al día con la v2.1 · App Java ⬜ pendiente (ver §7)
+**Estado de implementación:** App Python ✅ al día con la v2.2 · App Java ⬜ pendiente (ver §7)
 
 El esquema formal vive en **[`contrato.proto`](contrato.proto)**. Este documento especifica lo que
 el `.proto` no puede expresar: validación, orden de los chequeos, semántica de los errores y qué
@@ -51,9 +51,11 @@ No es sólo "otro formato". Tres cosas dejan de funcionar como antes:
    `servidoPor` rompía a todos los clientes. En Protobuf lo que viaja es el número de campo, así
    que renombrar es gratis y **cambiar un número es catastrófico**. Nunca se reutiliza un número
    liberado.
-2. **Se pierde la distinción entre "ausente" y "vacío".** En proto3 un `string` que no se manda
-   llega como `""` y un `int32` como `0`: no hay forma de saber si el cliente omitió el campo o lo
-   mandó vacío. Media matriz de casos borde de la v1.3 desaparece por esto (§6).
+2. **Ausente y vacío dejan de distinguirse.** En proto3 un `string` que no se manda llega como
+   `""` y un `int32` como `0`. Se puede recuperar la distinción marcando el campo como `optional`
+   —desde proto3 3.15 eso habilita la presencia explícita—, pero **el contrato elige no hacerlo**:
+   la v1.3 ya trataba igual al campo ausente y al vacío, así que la diferencia no le servía a
+   nadie. Media matriz de casos borde desaparece por esta decisión (§6).
 3. **El tipo hace cumplir parte del contrato.** `legajo` es `int32`: un string numérico o un
    decimal ya no llegan al servidor, los rechaza el stub. Lo que antes era una regla de validación
    ahora es un error de compilación del cliente.
@@ -62,7 +64,7 @@ No es sólo "otro formato". Tres cosas dejan de funcionar como antes:
 
 ## 2. `Identidad` — identidad de la instancia
 
-`rpc Identidad(Vacio) returns (Instancia)`
+`rpc Identidad(IdentidadPedido) returns (Instancia)`
 
 | Campo | Tipo | Detalle |
 | :--- | :--- | :--- |
@@ -84,7 +86,12 @@ No es sólo "otro formato". Tres cosas dejan de funcionar como antes:
 
 ## 3. `Salud` — chequeo de salud
 
-`rpc Salud(Vacio) returns (EstadoSalud)` → `status: "ok"`, `app`, `version`.
+`rpc Salud(SaludPedido) returns (EstadoSalud)` → `status: SANO`, `app`, `version`.
+
+`status` es un **enumerado**, no un string. Con texto libre una implementación puede mandar `"ok"` y
+la otra `"OK"`, que es justo la clase de divergencia que este documento evita. El valor `0` del
+enum (`ESTADO_NO_ESPECIFICADO`) es obligatorio en proto3 y es el que llega si el campo no se manda,
+así que **no** significa "sano".
 
 Cualquier respuesta que no sea `OK` significa que la instancia no está sana.
 
@@ -103,15 +110,14 @@ Devuelve `pong` con el valor recibido, más `servido_por` y `version`.
 
 **Si `ping` viene vacío:** `INVALID_ARGUMENT` con el mensaje `se requiere el campo ping`.
 
-> En proto3 no se puede distinguir "no mandó `ping`" de "mandó `ping` vacío": los dos llegan como
-> `""`. El contrato se apoya en eso y trata a los dos igual, que es lo que la v1.3 ya hacía por
-> decisión propia.
+> Los dos casos llegan como `""` mientras el campo no se declare `optional`. El contrato se apoya
+> en eso a propósito y los trata igual, que es lo que la v1.3 ya hacía por decisión propia.
 
 ---
 
 ## 5. `ListarPersonas` — estado compartido
 
-`rpc ListarPersonas(Vacio) returns (ListaPersonas)`
+`rpc ListarPersonas(ListarPersonasPedido) returns (ListaPersonas)`
 
 Devuelve `servido_por` y las personas **ordenadas por `id` ascendente**. Sin personas cargadas
 devuelve la lista vacía, no un error.
@@ -219,7 +225,7 @@ argumento más fuerte a favor de este cambio, y va en el informe.
 | :--- | :--- |
 | 1 | Generar los stubs desde `contrato.proto` (`protoc` + `grpc-java`) |
 | 2 | Reemplazar el servidor HTTP por un servidor gRPC |
-| 3 | Los seis RPC de §2 a §6 |
+| 3 | Los cinco RPC de §2 a §6, con un mensaje de pedido propio por método |
 | 4 | `grpc.health.v1.Health` además de `Salud` (§3) |
 | 5 | `/personas` sobre Redis con el esquema de §5 y la validación de §6 |
 | 6 | Bitácora a disco (§8) |
@@ -319,6 +325,7 @@ las cuales el balanceador no puede reenviar tráfico.
 | 1.2 | 06/09/2026 | `equipo` pasa a lista de objetos con `nombre`, `apellido` y `legajo`. `mensaje` se fija como texto plano. El `checksum` queda fuera del contrato. |
 | 1.3 | 06/09/2026 | `/personas` gana las reglas de validación, el orden en que se aplican y una matriz de casos borde. |
 | 2.0 | 06/09/2026 | **Cambio incompatible: el transporte pasa de HTTP/JSON a gRPC sobre HTTP/2 con Protobuf.** El esquema formal se muda a `contrato.proto`. Los códigos HTTP se reemplazan por códigos de estado gRPC. Trece casos borde desaparecen porque el tipado los hace imposibles. Se agrega `grpc.health.v1.Health`, el despliegue en contenedores (§9) y los requisitos nuevos de Plataforma (§10). |
-| **2.1** | **06/09/2026** | **Se sacan del contrato el RPC `Lenta` y las dos extensiones de App Python (`checksum` y rate limiting): el grupo decidió no usarlos.** El servicio queda en cinco RPC. El graceful shutdown sigue implementado, pero ya no hay un RPC lento con que evidenciarlo. |
+| 2.1 | 06/09/2026 | **Se sacan del contrato el RPC `Lenta` y las dos extensiones de App Python (`checksum` y rate limiting): el grupo decidió no usarlos.** El servicio queda en cinco RPC. El graceful shutdown sigue implementado, pero ya no hay un RPC lento con que evidenciarlo. |
+| **2.2** | **06/09/2026** | `Vacio` se reemplaza por un mensaje de pedido propio por método (`IdentidadPedido`, `SaludPedido`, `ListarPersonasPedido`): con uno compartido, el día que un método necesite un campo nuevo se lo agregaría también a los otros dos. `EstadoSalud.status` pasa de string a **enumerado**. |
 
 ---

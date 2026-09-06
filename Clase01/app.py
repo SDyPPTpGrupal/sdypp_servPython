@@ -1,4 +1,4 @@
-"""App Python — servidor gRPC del contrato v2.1.
+"""App Python — servidor gRPC del contrato v2.2.
 
 El esquema formal está en contrato.proto; las reglas que el .proto no puede
 expresar (validación, orden de los chequeos, semántica de los errores) están en
@@ -258,7 +258,7 @@ class Servicio(pb_grpc.ServicioServicer):
 
     def Salud(self, request, context):
         bitacora("Salud", "OK")
-        return pb.EstadoSalud(status="ok", app=APP_NAME, version=VERSION)
+        return pb.EstadoSalud(status=pb.EstadoSalud.SANO, app=APP_NAME, version=VERSION)
 
     def Echo(self, request, context):
         # En proto3 no se distingue "no mandó ping" de "mandó ping vacío": los dos

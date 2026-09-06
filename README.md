@@ -76,7 +76,7 @@ grpcurl -plaintext localhost:8101 sdypp.Servicio/Identidad
 
 El esquema formal está en **[`contrato.proto`](contrato.proto)**; las reglas que el `.proto` no
 puede expresar —validación, orden de los chequeos, semántica de los errores— están en
-**[`CONTRATO.md`](CONTRATO.md) v2.1**. Ante una diferencia, **manda el contrato**, no este README.
+**[`CONTRATO.md`](CONTRATO.md) v2.2**. Ante una diferencia, **manda el contrato**, no este README.
 
 | RPC | Qué hace |
 | :--- | :--- |
@@ -239,7 +239,8 @@ del timestamp de arranque hasta qué devolvía `echo` sin `ping`. Están todas r
 | 1.2 | `equipo` estructurado, `mensaje` texto plano, `checksum` fuera del contrato |
 | 1.3 | Validación de `/personas`, el **orden** de los chequeos y la matriz de casos borde |
 | 2.0 | El transporte pasa de HTTP/JSON a gRPC + Protobuf |
-| **2.1** | **Salen `Lenta`, el checksum y el rate limiting** |
+| 2.1 | Salen `Lenta`, el checksum y el rate limiting |
+| **2.2** | **Un mensaje de pedido por método y `status` como enumerado** |
 
 ### Por qué gRPC cambia más que el formato
 

@@ -1,4 +1,4 @@
-# Dependencias de la App Python.
+# Dependencias de ejecución de la App Python.
 #
 # Instalación dentro del entorno virtual:
 #   python3 -m venv .venv
@@ -6,6 +6,17 @@
 #   .venv\Scripts\Activate.ps1       # Windows (PowerShell)
 #   pip install -r requirements.txt
 #
-# redis: contador compartido del rate limiting. Sin esto cada réplica lleva su
-# propia cuenta y el límite deja de ser del servicio (ver Clase01/app.py).
+# Con Docker no hace falta: la imagen las instala sola (ver Dockerfile).
+
+# grpcio: el servidor gRPC del contrato v2.0.
+grpcio==1.83.1
+# protobuf: serialización de los mensajes de contrato.proto.
+protobuf==7.36.1
+# health-checking: el servicio grpc.health.v1.Health que consultan el HEALTHCHECK
+# del contenedor y el balanceador (CONTRATO.md §3).
+grpcio-health-checking==1.83.1
+# reflection: permite que el verificador del equipo cruzado nos pruebe con grpcurl
+# sin tener el .proto ni los stubs (CONTRATO.md §11.6).
+grpcio-reflection==1.83.1
+# redis: la base compartida de personas y el contador del rate limiting.
 redis==8.1.0

@@ -1,0 +1,5 @@
+# Sólo para generar los stubs desde contrato.proto. No hace falta en ejecución:
+# la imagen final no lo lleva (ver Dockerfile, etapa builder).
+#
+#   python -m grpc_tools.protoc -I. --python_out=Clase01 --grpc_python_out=Clase01 contrato.proto
+grpcio-tools==1.83.1

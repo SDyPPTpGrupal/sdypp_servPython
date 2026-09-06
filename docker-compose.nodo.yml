@@ -17,8 +17,10 @@
 
 services:
   app:
-    image: sdypp-app-python:${TAG:-latest}
-    build: .
+    # Sin `build`: la imagen la manda ya construida el deploy.sh (docker save |
+    # docker load). Así las cuatro réplicas corren exactamente el mismo binario
+    # y ninguna máquina de casa tiene que compilar nada.
+    image: sdypp-app-python:${TAG:?falta TAG, lo pasa el deploy.sh}
     environment:
       # El color va en la identidad de la instancia: es lo que permite ver en la
       # respuesta y en la bitácora cuál de las dos atendió durante el blue-green.

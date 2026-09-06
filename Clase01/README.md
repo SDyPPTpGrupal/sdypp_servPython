@@ -202,8 +202,37 @@ atrás sea un comando y no un deploy completo en reversa; se baja recién cuando
 versión. Eso implica dos procesos vivos por réplica, y es a propósito.
 
 > ⚠️ El paso 5 depende de una interfaz con el balanceador de Plataforma que **todavía no está
-> definida**: cómo se le pide que cambie de destino. El `deploy.sh` lo aísla en una función para
-> poder escribir todo lo demás mientras tanto.
+> definida**: cómo se le pide que cambie de destino. El `deploy.sh` lo aísla en dos funciones
+> (`conmutar_a` y `destino_actual`) para poder escribir y probar todo lo demás mientras tanto.
+
+### `deploy/deploy.sh`
+
+Corre dentro del contenedor CI/CD, que llega a las máquinas de cada casa por SSH sobre Tailscale.
+
+```bash
+./deploy.sh desplegar casa-tomas    # blue-green completo, aborta solo si falla
+./deploy.sh rollback  casa-tomas    # vuelve al color anterior
+./deploy.sh estado    casa-tomas    # qué corre hoy en ese nodo
+```
+
+| Paso | Qué hace |
+| :--- | :--- |
+| **Build** | Construye la imagen en el CI/CD. El `.proto` se compila dentro del `Dockerfile`, así que un error revienta acá y no en la casa de alguien con el deploy a medio hacer. |
+| **Ship** | `docker save \| gzip \| ssh docker load`. Se manda la **imagen ya construida**, no el código: las cuatro réplicas corren exactamente el mismo binario y ninguna máquina compila. |
+| **Arriba** | Levanta la verde al lado de la azul, en el otro puerto y con su propio proyecto de compose. La que sirve no se toca. |
+| **Verify** | Pregunta por el `HEALTHCHECK` del contenedor —que ya consulta `grpc.health.v1.Health`, así que el CI/CD no necesita un cliente gRPC— **y además compara la versión**: un `healthy` solo no alcanza, porque un ship a medias deja al contenedor sano corriendo la versión anterior. |
+| **Conmutar** | Le pide al balanceador que apunte a la verde. ⬜ Pendiente de Plataforma. |
+| **Listo** | La azul **queda viva**: por eso el rollback es un comando y no un deploy en reversa. |
+
+Si el Verify falla, el script baja la verde, **no conmuta** y sale con código ≠ 0. La azul nunca dejó
+de servir y el usuario no vio nada — que es exactamente el *"deploy que se aborta solo"* del
+enunciado.
+
+El estado (qué color sirve y cuál era el anterior) se guarda en `deploy/estado/<nodo>.env`. Pero el
+`estado` también consulta el destino real del balanceador: si alguien conmutó a mano, nuestro
+archivo miente y el rollback volvería al backend equivocado.
+
+---
 
 ---
 

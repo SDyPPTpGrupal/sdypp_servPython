@@ -17,3 +17,4 @@ Clase01/contrato_pb2_grpc.py
 
 # Bitácora y logs: son del disco local de cada nodo (CONTRATO.md §9).
 logs/
+deploy/estado/

@@ -1,6 +1,9 @@
 # Sistemas Distribuidos y Programación Paralela (SDyPP) - Mini-Nube
 
-Servidor HTTP liviano desarrollado en Python para la simulación de despliegues manuales, traspaso de mando y gestión de concurrencia sobre un puerto TCP compartido.
+Servicio **gRPC** en Python, replicado entre las casas del grupo y desplegado en contenedores.
+Nació como un servidor HTTP para el deploy manual de la Clase 1; en la Clase 2 pasó a ser un
+servicio distribuido: réplicas *stateless* detrás de un balanceador, estado compartido en una base
+y despliegues que no cortan el servicio.
 
 ---
 
@@ -13,57 +16,87 @@ Servidor HTTP liviano desarrollado en Python para la simulación de despliegues 
 
 ## Comandos
 
-Desde la raíz del repositorio:
+Todo el servicio se levanta con Docker. Desde la raíz del repositorio:
+
+```bash
+# El directorio de la bitácora se crea ANTES: si lo crea Docker queda de root
+# y el proceso, que corre sin privilegios, no puede escribir adentro.
+mkdir -p logs/app-1 logs/app-2
+
+docker compose up --build -d
+docker compose ps          # las dos réplicas y la base tienen que quedar (healthy)
+```
+
+Quedan levantados tres contenedores: la base compartida y **dos réplicas** de la app, en los
+puertos `8101` y `8102`. Para bajar todo:
+
+```bash
+docker compose down          # conserva los datos de la base
+docker compose down -v       # los borra también
+```
+
+### Sin Docker
+
+Hace falta generar antes los stubs de Protobuf, que no se versionan porque son producto del build:
 
 ```bash
 python3 -m venv .venv
-
-# Activar el entorno, según el sistema operativo:
 source .venv/bin/activate          # Linux / macOS
 # .venv\Scripts\Activate.ps1       # Windows (PowerShell)
 # .venv\Scripts\activate.bat       # Windows (cmd)
 
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-build.txt
+python3 -m grpc_tools.protoc -I. --python_out=Clase01 --grpc_python_out=Clase01 contrato.proto
+
 python3 Clase01/app.py 8080
 ```
 
-El servidor queda escuchando en `http://0.0.0.0:8080`, que es también el puerto por defecto si no
-se pasa ninguno. Para levantar varias réplicas a la vez, pasarle a cada una un puerto distinto.
+### Probar una réplica
 
-`/personas` necesita la base compartida. Para levantarla localmente y apuntar dos réplicas a la
-misma:
+Con gRPC ya no alcanza un `curl`: el cliente necesita los stubs. Para eso está `cliente.py`:
 
 ```bash
-docker run -d --name tp-redis -p 6379:6379 redis:8-alpine
-
-export TP_REDIS_URL=redis://127.0.0.1:6379/0
-HOST_NAME=casa-tomas-1 python3 Clase01/app.py 8101 &
-HOST_NAME=casa-tomas-2 python3 Clase01/app.py 8102 &
-
-# el alta la atiende una réplica y la lectura la otra: el dato está igual
-curl -s -X POST -d '{"nombre":"Ada Lovelace","legajo":100200}' http://127.0.0.1:8101/personas
-curl -s http://127.0.0.1:8102/personas
+python3 Clase01/cliente.py localhost:8101 identidad
+python3 Clase01/cliente.py localhost:8101 salud
+python3 Clase01/cliente.py localhost:8101 alta "Ada Lovelace" 100200
+python3 Clase01/cliente.py localhost:8102 personas      # el alta la atendió una réplica
+                                                        # y la lectura la otra: el dato está
 ```
 
-Sin `TP_REDIS_URL`, `/personas` responde `503`; las demás rutas siguen funcionando normal.
+El servidor también expone **reflection**, así que se lo puede llamar sin tener el `.proto`:
 
-## 🚀 Endpoints de la Aplicación
+```bash
+grpcurl -plaintext localhost:8101 list
+grpcurl -plaintext localhost:8101 sdypp.Servicio/Identidad
+```
 
-| Método | Ruta | Descripción |
-| :--- | :--- | :--- |
-| `GET` | `/` | Retorna metadatos de la app (nombre, equipo, versión, timestamp de arranque y host). |
-| `GET` | `/health` | Chequeo de salud del servicio (retorna `{"status": "ok"}`). |
-| `POST` | `/echo` | Recibe JSON `{"ping": "mensaje"}` y responde `{"pong": "mensaje"}`. |
-| `GET` | `/slow` | Endpoint simulador de peticiones en vuelo (sleep de 4s) para probar **Graceful Shutdown**. |
-| `GET` | `/personas` | Lista lo guardado en la base compartida, ordenado por `id`. |
-| `POST` | `/personas` | Alta. Recibe `{"nombre": "...", "legajo": 123}` y devuelve `201` con la persona creada. |
+---
 
-Las reglas de validación de `/personas`, el orden en que se aplican y la matriz de casos borde
-están en **[`CONTRATO.md`](CONTRATO.md) §6** — son contrato, no detalle de implementación.
+## 🚀 Los RPC del servicio
+
+El esquema formal está en **[`contrato.proto`](contrato.proto)**; las reglas que el `.proto` no
+puede expresar —validación, orden de los chequeos, semántica de los errores— están en
+**[`CONTRATO.md`](CONTRATO.md) v2.0**. Ante una diferencia, **manda el contrato**, no este README.
+
+| RPC | Qué hace |
+| :--- | :--- |
+| `Identidad` | Metadatos de la instancia: app, lenguaje, equipo, versión, host y arranque. |
+| `Salud` | Chequeo de salud del servicio. |
+| `Echo` | Recibe `ping` y responde `pong`, con `servido_por` y `version`. |
+| `Lenta` | RPC deliberadamente lento (4 s) para probar el **graceful shutdown** y el deploy sin downtime. |
+| `ListarPersonas` | Lo guardado en la base compartida, ordenado por `id`. |
+| `CrearPersona` | Alta. El `id` **lo asigna la base**, nunca la app. |
+
+Además del RPC `Salud` del contrato se expone **`grpc.health.v1.Health`**, el health checking
+estándar: es lo que consultan el `HEALTHCHECK` del contenedor y el balanceador.
 
 ---
 
 ## 🏗️ Diagrama de Arquitectura
+
+> Éste es el de la **Clase 1**: las tres casas contra un servidor compartido, con el puerto
+> como recurso en exclusión mutua. Los de la Clase 2 —uno por etapa, con el balanceador, las
+> réplicas y la base— están pendientes.
 
 Tres casas, ninguna en la misma red, coordinadas por Meet/Discord. El equipo **Plataforma** monta
 el servidor y reparte el acceso; **App Java** y **App Python** compiten por el mismo puerto de
@@ -136,265 +169,167 @@ frenó qué proceso.
 
 ---
 
-## 🔄 Diagrama de Flujo del Pipeline (Build → Ship → Stop → Start → Verify)
+---
+
+## 🔄 El pipeline (Build → Ship → Arriba → Verify)
 
 ```mermaid
 flowchart TD
-    START(["Cambio trivial en local<br/>subir VERSION y cambiar mensaje"]) --> BUILD
-    BUILD["1 - BUILD<br/>Java compila con mvn hasta el .jar<br/>Python arma el venv e instala requirements.txt<br/>los dos resuelven dependencias, uno ademas compila"] --> SHIP
-    SHIP["2 - SHIP<br/>scp del archivo por el tunel TCP<br/>con nombre propio, sin pisar el .jar de Java"] --> TUNEL
+    START(["Cambio en local<br/>subir VERSION y cambiar mensaje"]) --> BUILD
+    BUILD["1 - BUILD<br/>generar los stubs desde contrato.proto<br/>y construir la imagen Docker"] --> SHIP
+    SHIP["2 - SHIP<br/>llevar la imagen al nodo destino<br/>por la red de Tailscale"] --> ARRIBA
 
-    TUNEL{"Responde el tunel de deploy?"}
-    TUNEL -->|"Connection refused"| CAIDO["El address TCP cambio o el agente esta abajo<br/>pedirle el puerto nuevo a Plataforma"]
-    CAIDO --> SHIP
-    TUNEL -->|"Si"| CHECK
+    ARRIBA["3 - ARRIBA<br/>levantar la VERDE al lado de la AZUL<br/>en otro puerto, sin tocar la que sirve"] --> VERIFY
 
-    CHECK{"CONTENCION DEL PUERTO<br/>el 80 esta libre?"}
-    CHECK -->|"No, lo tiene la otra app"| COLISION
-    CHECK -->|"Si"| STARTP
+    VERIFY{"4 - VERIFY<br/>Salud de la verde<br/>responde OK y con la version nueva?"}
+    VERIFY -->|"no"| ABORT["ABORTA SOLO<br/>se baja la verde y no se conmuta<br/>la azul nunca dejo de servir"]
+    VERIFY -->|"si"| CONMUTAR
 
-    COLISION["COLISION PASIVA - se provoca a proposito en la demo<br/>arrancar sin frenar al anterior da Address already in use<br/>la app nueva NO toma el puerto y la vieja sigue sirviendo"] --> STOP
+    CONMUTAR["5 - CONMUTAR<br/>pedirle al balanceador que apunte a la verde"] --> PUBLICO
 
-    STOP["3 - STOP coordinado<br/>identificar el PID que tiene el 80 y mandarle SIGTERM<br/>nunca kill -9: cortaria las peticiones en vuelo<br/>el graceful shutdown drena y recien ahi libera el puerto"] --> STARTP
+    PUBLICO{"6 - VERIFY PUBLICO<br/>la URL publica responde la version nueva?"}
+    PUBLICO -->|"no"| ROLLBACK
+    PUBLICO -->|"si"| OK(["Deploy verificado<br/>la AZUL queda viva para el rollback"])
 
-    STARTP["4 - START<br/>levantar con nohup en segundo plano<br/>para que sobreviva al cierre de la sesion SSH"] --> VERIFY
+    ROLLBACK["ROLLBACK<br/>volver a apuntar a la azul<br/>que sigue corriendo al lado"]
 
-    VERIFY{"5 - VERIFY, DESDE OTRA CASA<br/>curl a la URL publica con el header de ngrok"}
-    VERIFY -->|"404 ERR_NGROK_3200"| E404["El tunel HTTP esta caido<br/>es del lado de Plataforma"]
-    VERIFY -->|"502"| E502["El tunel vive pero nadie escucha en 80<br/>se cayo el Start"]
-    E502 --> STARTP
-    VERIFY -->|"Llega HTML en vez de JSON"| EHTML["Falta el header ngrok-skip-browser-warning<br/>es la pantalla de aviso del plan free"]
-    EHTML --> VERIFY
-    VERIFY -->|"200 con la app y la version nuevas"| OK(["Deploy verificado<br/>anotar el downtime entre el SIGTERM y el primer 200"])
-
-    style CHECK fill:#f96,stroke:#333,stroke-width:3px,color:#111
-    style COLISION fill:#f66,stroke:#333,stroke-width:2px,color:#111
+    style VERIFY fill:#f96,stroke:#333,stroke-width:3px,color:#111
+    style ABORT fill:#f66,stroke:#333,stroke-width:2px,color:#111
+    style ROLLBACK fill:#f66,stroke:#333,stroke-width:2px,color:#111
 ```
 
-Los comandos exactos de cada paso:
+**La versión vieja no se baja al terminar el deploy.** Queda corriendo al lado para que volver
+atrás sea un comando y no un deploy completo en reversa; se baja recién cuando entra una tercera
+versión. Eso implica dos procesos vivos por réplica, y es a propósito.
 
-> **Datos de acceso.** El host y el puerto del túnel de deploy, el usuario y su contraseña **no se
-> versionan**: los publica el equipo Plataforma por Discord y cambian cada vez que reinician el
-> agente de ngrok. Los `<PLACEHOLDER>` de abajo se reemplazan al momento de desplegar.
-
-
-```bash
-# 1 · Build  (en la máquina de quien despliega)
-python3 -m venv .venv
-source .venv/bin/activate          # Linux / macOS
-# .venv\Scripts\Activate.ps1       # Windows (PowerShell)
-pip install -r requirements.txt
-
-# 2 · Ship
-scp -P <PUERTO_NGROK> Clase01/app.py requirements.txt <USUARIO>@<HOST_TCP_NGROK>:/home/<USUARIO>/
-
-# 3 · Stop  (dentro del servidor)
-ssh -p <PUERTO_NGROK> <USUARIO>@<HOST_TCP_NGROK>
-ps aux | grep -E 'java|python3'
-kill <PID>
-
-# 4 · Start
-nohup python3 ~/app-python.py 80 > ~/python.log 2>&1 &
-
-# 5 · Verify  (desde otra casa)
-curl -s -H "ngrok-skip-browser-warning: 1" https://<DOMINIO>.ngrok-free.dev/
-curl -s -H "ngrok-skip-browser-warning: 1" https://<DOMINIO>.ngrok-free.dev/health
-```
-
-En la demo se provoca la **colisión pasiva a propósito** (arrancar sin coordinar el Stop), se la
-reconoce por el `Address already in use`, y se muestra que la app anterior siguió sirviendo sin
-enterarse. Recién después va el traspaso ordenado: Stop → Start → Verify.
+> ⚠️ El paso 5 depende de una interfaz con el balanceador de Plataforma que **todavía no está
+> definida**: cómo se le pide que cambie de destino. El `deploy.sh` lo aísla en una función para
+> poder escribir todo lo demás mientras tanto.
 
 ---
 
 ## 🌟 Aportes Propios Justificados
 
-> ℹ️ **De los tres aportes, uno entró al contrato común** (ver [`CONTRATO.md`](CONTRATO.md)):
-> la ruta `/slow` del graceful shutdown, que ahora implementan las dos apps y está siempre activa.
->
-> El **checksum** y el **rate limiting** quedaron afuera, porque App Java no los tiene: con el
-> balanceador repartiendo entre las dos, el servicio respondería distinto según quién atendió.
-> Siguen en el código de App Python detrás de un interruptor, **apagados por defecto**:
+> ℹ️ **Ninguno de los tres entró al contrato común.** `Lenta` sí, porque las dos apps la necesitan
+> para probar el drenado. El **checksum** y el **rate limiting** quedaron afuera porque App Java no
+> los tiene: con el balanceador repartiendo entre las dos, el servicio respondería distinto según
+> quién atendió. Siguen en el código detrás de un interruptor, **apagados por defecto**:
 >
 > ```bash
-> python3 Clase01/app.py 8080                                    # respuesta del contrato
-> TP_CHECKSUM=on TP_RATE_LIMIT=on python3 Clase01/app.py 8080     # con las dos extensiones
+> TP_CHECKSUM=on TP_RATE_LIMIT=on python3 Clase01/app.py 8080
 > ```
->
-> Los ejemplos de los Aportes 2 y 3 asumen la variable correspondiente encendida.
 
 ---
 
-### Aporte 1: Graceful Shutdown & Drenado de Conexiones
+### Aporte 1: Graceful Shutdown & Drenado de RPCs
 
 #### ¿En qué consiste?
-Implementación de un manejador de señales a nivel del Sistema Operativo (`signal.SIGTERM` y `signal.SIGINT`) en el servidor `ThreadingHTTPServer`. 
 
-Cuando el proceso recibe una señal de detención (`kill <PID>` o `Ctrl+C`):
-1. **Deja de aceptar nuevas conexiones** cerrando el listener del socket TCP de inmediato (liberando el puerto para el siguiente despliegue).
-2. **Drena las conexiones activas**: Espera a que las peticiones HTTP que ya se encontraban en curso (en ejecución en sus respectivas hebras) terminen de procesarse y responder al cliente.
-3. **Apaga el proceso de forma limpia**. Quedan sockets en `TIME_WAIT` — es inevitable en TCP —
-   pero el servidor activa `SO_REUSEADDR`, así que el siguiente deploy toma el 8080 igual,
-   sin esperar el minuto de espera del kernel.
+Un manejador de `SIGTERM` y `SIGINT` que apaga el servidor en dos tiempos, en vez de morirse de
+golpe:
 
----
+1. **Se declara `NOT_SERVING`** en el health checking estándar. El balanceador lo ve en su próximo
+   chequeo y la saca de rotación: deja de mandarle RPCs nuevos *mientras todavía está atendiendo
+   los que tiene*.
+2. **`server.stop(grace=10)`**: deja de aceptar RPCs nuevos y espera hasta 10 segundos a que
+   terminen los que están en vuelo.
+3. Recién ahí libera el puerto y termina el proceso.
+
+El orden importa: sin el paso 1, el balanceador sigue derivando peticiones a una réplica que ya
+está cerrando, y esas fallan.
 
 #### ¿Cómo probarlo?
 
-1. **Iniciar el servidor en una terminal**:
-   ```bash
-   python3 Clase01/app.py 8080
-   ```
-   *Anotar el PID que imprime en pantalla (ejemplo: PID 13058).*
+```bash
+# 1. Lanzar un RPC lento (tarda 4 segundos)
+python3 Clase01/cliente.py localhost:8101 lenta &
 
-2. **Lanzar una petición en vuelo (lenta) desde otra terminal**:
-   ```bash
-   curl -i http://<IP_ADDRESS>:8080/slow
-   ```
-   *(Esta petición tarda 4 segundos en responder).*
+# 2. Dentro de esos 4 segundos, mandarle SIGTERM al contenedor
+docker compose stop app-1
+```
 
-3. **Inmediatamente (dentro de los 4 segundos), enviar la señal `SIGTERM` desde una tercera terminal**:
-   ```bash
-   # Reemplazar <PID> por el PID real de tu servidor
-   kill -15 <PID>
-   ```
+**Resultado:** el cliente **no se corta**. Espera sus 4 segundos y recibe la respuesta completa.
+En el log del contenedor:
 
-4. **Resultado Observado**:
-   * **En la terminal del `curl`**: La petición **NO se corta**. Espera sus 4 segundos y recibe un `200 OK` completo con el JSON de respuesta.
-   * **En la terminal del servidor**: Se observa el log:
-     ```text
-     [ Graceful Shutdown ] Recibida señal SIGTERM (señal 15). Drenando conexiones y apagando servidor de forma limpia...
-     [/slow] Petición lenta finalizada.
-     [ Graceful Shutdown ] Puerto TCP liberado y servidor detenido exitosamente.
-     ```
-   * El puerto 8080 queda inmediatamente disponible para que otro integrante pueda levantar su app sin sufrir la colisión pasiva (`Address already in use`).
+```text
+[Lenta] procesando (4 segundos)...
+[ Graceful Shutdown ] Recibida SIGTERM. Marcando NOT_SERVING y drenando...
+2026-09-06T18:04:30-03:00 | python@casa-tomas | Lenta | OK | -
+[ Graceful Shutdown ] Puerto liberado y servidor detenido exitosamente.
+```
+
+El `stop_grace_period` del compose está en 15 s **a propósito**: tiene que ser mayor que los 4 s de
+`Lenta` más el margen del servidor, o Docker manda `SIGKILL` en medio del drenado y todo esto no
+sirve de nada.
 
 ---
 
 ### Aporte 2: Hash de Integridad del Código en Tiempo de Ejecución (SHA-256)
 
 #### ¿En qué consiste?
-Al arrancar, la aplicación lee su propio archivo fuente (`app.py`), calcula su checksum criptográfico SHA-256 utilizando la librería estándar (`hashlib`) y lo expone en el campo `"checksum"` de las respuestas `GET /` y `GET /health`.
+
+Al arrancar, la aplicación lee su propio archivo fuente, calcula su SHA-256 con `hashlib` y lo
+informa. Con `TP_CHECKSUM=on` lo imprime en el banner de arranque.
+
+#### ¿Para qué sirve, ahora que hay réplicas?
+
+Dos réplicas pueden informar las dos `version: 2` y estar corriendo código distinto: un `scp` que se
+cortó, una imagen vieja en caché, alguien que editó el archivo a mano en el servidor. **El número de
+versión no detecta eso; el hash sí.**
+
+```bash
+docker compose logs app-1 | grep checksum
+docker compose logs app-2 | grep checksum
+sha256sum Clase01/app.py        # tiene que coincidir con los dos
+```
+
+No reemplaza a `version`: **detecta cuándo `version` miente**. Es la respuesta directa a una de las
+picantes del enunciado, la de la instancia que responde bien pero devuelve basura.
 
 ---
 
-#### ¿Cómo probarlo?
-
-1. **Consultar el hash remoto desplegado**:
-   ```bash
-   curl -s http://<IP_ADDRESS>:8080/health
-   ```
-   *Respuesta recibida:*
-   ```json
-   {
-     "status": "ok",
-     "app": "python",
-     "version": 1,
-     "checksum": "a3f8b1c4e5..."
-   }
-   ```
-
-2. **Verificar localmente con sha256sum**:
-   ```bash
-   sha256sum Clase01/app.py
-   ```
-   Comprobar que el hash obtenido localmente coincide exactamente con el valor devuelto por el servidor remoto, confirmando la integridad.
-
----
-
-### Aporte 3: Rate Limiting con Ventana Deslizante (Protección contra Sobrecarga)
+### Aporte 3: Rate Limiting con Ventana Deslizante
 
 #### ¿En qué consiste?
 
-> **Apagado por defecto.** App Java no limita, así que con el balanceador repartiendo entre las
-> dos implementaciones el mismo cliente recibiría `429` de una réplica y `200` de otra. Quedó
-> como extensión fuera del contrato (§9 de [`CONTRATO.md`](CONTRATO.md)): se enciende con
-> `TP_RATE_LIMIT=on`.
+Un **interceptor** de gRPC que limita las peticiones por cliente en una ventana deslizante y
+responde `RESOURCE_EXHAUSTED` al superar el límite. Va como interceptor y no dentro de cada método
+por la misma razón por la que en HTTP iba antes del ruteo: si no, una ráfaga contra un método
+inexistente no quedaría limitada.
 
-Limitador de tasa por algoritmo de ventana deslizante (`Sliding Window`). Cada cliente (IP)
-puede realizar un máximo de **100 peticiones cada 60 segundos**; al superarlo, el servidor
-responde `429 Too Many Requests`. El código no clava el número: lo toma del enumerado
-`http.HTTPStatus` de la biblioteca estándar, que es la traducción del RFC de HTTP.
+Cubre **todos los RPC, `Salud` incluido**. Un chequeo de salud sin límite es el más fácil de usar
+para terminar de tirar abajo un servicio ya degradado, y además suele ser el más público: el resto
+de los métodos puede no estar difundido.
 
-El default está elegido para no chocar con el health check del balanceador, que consulta
-`/health` de forma periódica desde una única IP: con un límite muy bajo recibiría `429`,
-interpretaría que la instancia está caída y sacaría de rotación réplicas sanas.
+#### El contador vive en Redis, no en memoria
 
-**Cubre todas las rutas, `/health` incluida.** Un endpoint de salud sin límite es el más fácil
-de usar para terminar de tirar abajo un servicio ya degradado, y además suele ser el más público:
-el resto de las rutas puede no estar difundido.
+Es el punto que importa con réplicas. Con el contador en la RAM del proceso, cada réplica lleva su
+propia cuenta y el límite efectivo se multiplica por la cantidad de réplicas: un límite de 100
+pasa a ser de 200 con dos. Por eso el contador va a Redis, con un script Lua que hace el chequeo y
+el alta en **una sola operación atómica** — si se resolviera en dos viajes, dos réplicas podrían
+leer el mismo conteo y ambas dejar pasar la petición que debía cortarse.
 
-**Dónde vive el contador.** El limitador tiene dos backends intercambiables:
-
-| Backend | Cuándo se usa | Alcance del límite |
-| :--- | :--- | :--- |
-| `memoria` | Sin `TP_REDIS_URL` | Por instancia — cada réplica cuenta por su cuenta |
-| `redis` | Con `TP_REDIS_URL` definida | Por servicio — todas las réplicas comparten el contador |
-
-Con réplicas detrás de un balanceador el contador en memoria deja de servir: dos instancias
-llevan cuentas separadas y el límite efectivo se duplica. El backend Redis resuelve eso
-guardando cada IP como un *sorted set* cuyo score es el instante de la petición. El chequeo
-y el alta van en un script Lua para que sean **una sola operación atómica**: si se resolvieran
-en dos viajes, dos réplicas podrían leer el mismo conteo y ambas dejar pasar la petición que
-debía cortarse — el mismo problema de exclusión mutua que resuelve el `Lock` entre hebras,
-pero entre procesos que no comparten memoria.
-
-Si `TP_REDIS_URL` está definida pero Redis no responde, la app **arranca igual** con el
-contador local y lo deja dicho en el log: un Redis caído no debería dejar el servicio afuera.
-
-Variables de entorno: `TP_RATE_LIMIT` (`off`), `TP_REDIS_URL`, `TP_RATE_LIMIT_MAX` (100),
-`TP_RATE_LIMIT_WINDOW` (60). Sin `TP_RATE_LIMIT=on` las otras tres no hacen nada.
-
----
+Es el mismo problema de exclusión mutua que el lock entre hebras, pero entre procesos que no
+comparten memoria. Y es la respuesta a la pregunta 5 del enunciado: *¿qué se rompe con un contador
+en memoria?* Esto.
 
 #### ¿Cómo probarlo?
 
-**Una sola instancia** (contador local):
-
-1. **Encender la extensión y bajar el límite** para poder mostrarlo sin tirar 100 peticiones:
-   ```bash
-   TP_RATE_LIMIT=on TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10 python3 Clase01/app.py 8080
-   ```
-   El arranque confirma que quedó activa:
-   ```
-   [rate-limit] 5 peticiones cada 10s por IP, backend 'memoria', todas las rutas (extensión propia, fuera del contrato)
-   ```
-
-2. **Enviar ráfaga de peticiones continuas**:
-   ```bash
-   for i in {1..6}; do curl -s -o /dev/null -w "%{http_code}\n" http://<IP_ADDRESS>:8080/health; done
-   ```
-
-3. **Resultado Observado**:
-   * Peticiones 1 a 5: `200`
-   * Petición 6: `429` con el JSON de error:
-     ```json
-     {
-       "error": "Demasiadas peticiones (429 Too Many Requests)",
-       "mensaje": "Se superó el límite de 5 peticiones cada 10 segundos.",
-       "ip": "<IP_ADDRESS>"
-     }
-     ```
-
-**Dos réplicas compartiendo el contador** (es la prueba que importa para el balanceo):
-
 ```bash
-docker run -d --rm --name tp-redis -p 6399:6379 redis:7-alpine
-export TP_RATE_LIMIT=on                              # la extensión está apagada por defecto
-export TP_REDIS_URL="redis://127.0.0.1:6399/0"
-export TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10   # para que corte rápido en la demo
-python3 Clase01/app.py 8101 &
-python3 Clase01/app.py 8102 &
+TP_RATE_LIMIT=on TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10 \
+  TP_REDIS_URL=redis://127.0.0.1:6379/0 docker compose up -d
 
-# Alternar entre las dos, como repartiría un balanceador
-for i in {1..4}; do
-  curl -s -o /dev/null -w "A %{http_code}\n" http://127.0.0.1:8101/health
-  curl -s -o /dev/null -w "B %{http_code}\n" http://127.0.0.1:8102/health
+# Alternar entre las dos réplicas, como repartiría el balanceador
+for i in $(seq 1 8); do
+  python3 Clase01/cliente.py localhost:8101 salud > /dev/null 2>&1; echo "A $?"
+  python3 Clase01/cliente.py localhost:8102 salud > /dev/null 2>&1; echo "B $?"
 done
 ```
 
-Resultado esperado: **cinco `200` en total entre ambas** y `429` desde cualquiera de las dos
-a partir de la sexta — no cinco por cada una.
+Resultado esperado: **cinco respuestas en total entre ambas**, y `RESOURCE_EXHAUSTED` desde
+cualquiera de las dos a partir de la sexta — no cinco por cada una.
+
+---
 
 ## 🤝 Entrega 2 — Clase 2
 
@@ -402,83 +337,100 @@ La Clase 1 fue una app corriendo en un servidor. La Clase 2 la convierte en un *
 distribuido**: réplicas repartidas entre las casas del grupo, un balanceador que reparte el
 tráfico, estado compartido en una base y despliegues que no cortan el servicio.
 
-El cambio de fondo es que las réplicas dejan de ser "nuestra app". Para un cliente que entra por
-el balanceador, una réplica de App Python y una de App Java tienen que ser **indistinguibles**.
+El cambio de fondo es que las réplicas dejan de ser "nuestra app". Para un cliente que entra por el
+balanceador, una réplica de App Python y una de App Java tienen que ser **indistinguibles**.
 
 ### El contrato con App Java
 
-Al comparar las dos implementaciones lado a lado aparecieron **ocho divergencias**: desde el
-formato del timestamp de arranque hasta qué código devuelve `/echo` sin `ping`. Cualquiera de
-ellas rompe a un cliente que reciba respuestas de una réplica u otra según a quién derivó el
-balanceador.
+Al comparar las dos implementaciones lado a lado aparecieron **ocho divergencias**, desde el formato
+del timestamp de arranque hasta qué devolvía `echo` sin `ping`. Están todas resueltas en
+**[`CONTRATO.md`](CONTRATO.md)**, que pasó por cinco versiones en el proceso:
 
-Están todas resueltas en **[`CONTRATO.md`](CONTRATO.md)** (v1.3), que es la especificación que
-cumplen las dos apps. Ante una diferencia, **manda el contrato**, no este README.
+| Versión | Qué cerró |
+| :--- | :--- |
+| 1.0 – 1.1 | Las ocho divergencias; `/personas`, bitácora y rate limiting como extensión |
+| 1.2 | `equipo` estructurado, `mensaje` texto plano, `checksum` fuera del contrato |
+| 1.3 | Validación de `/personas`, el **orden** de los chequeos y la matriz de casos borde |
+| **2.0** | **El transporte pasa de HTTP/JSON a gRPC + Protobuf** |
 
-Tres de esas decisiones venían de la corrección de la Clase 1 y quedaron cerradas en la v1.2:
+### Por qué gRPC cambia más que el formato
 
-| Campo | Decisión | Por qué |
-| :--- | :--- | :--- |
-| `equipo` | Lista de **objetos** con `nombre`, `apellido` y `legajo` | El legajo viajaba embutido en el string del nombre, `"Tomás Resnik (Legajo 190168)"`, y había que parsear por paréntesis para sacarlo. Con un campo por dato no queda nada que parsear. |
-| `mensaje` | **Texto plano** | Se evaluó darle estructura. Hoy su único uso es hacer visible el cambio de contenido en cada deploy: una estructura que ningún cliente consume es una forma más de divergir entre las dos apps. |
-| `checksum` | **Fuera del contrato** | El hash de un `.py` no es comparable contra el de un `.jar`, así que el campo no permitiría contrastar dos réplicas: sólo mirar cada una por separado. Queda como diagnóstico de App Python. |
+No es "el mismo contrato en otro empaque". Tres cosas dejan de funcionar como antes:
 
-### Extensiones apagadas por defecto
+1. **Los nombres de los campos dejan de ser contrato; los números lo son.** En JSON, renombrar
+   `servidoPor` rompía a todos los clientes. En Protobuf lo que viaja es el número de campo:
+   renombrar es gratis y **cambiar un número es catastrófico**.
+2. **Se pierde la distinción entre "ausente" y "vacío".** En proto3 un `string` que no se manda
+   llega como `""` y un `int32` como `0`. No hay forma de saber si el cliente omitió el campo.
+3. **El tipo hace cumplir parte del contrato.** `legajo` es `int32`: un string numérico o un
+   decimal ya no llegan al servidor, los rechaza el stub del cliente. **Trece casos borde de la
+   v1.3 desaparecieron** porque el tipado los volvió imposibles.
 
-Los aportes propios de la Clase 1 son cosas que **sólo tiene App Python**. Con el balanceador
-repartiendo entre implementaciones distintas, una extensión encendida hace que el servicio
-responda distinto según quién atendió — justo lo que el contrato evita. Por eso quedan detrás de
-un interruptor, apagadas salvo que se pidan:
+### El estado compartido
 
-| Variable | Qué enciende | Default |
-| :--- | :--- | :--- |
-| `TP_CHECKSUM` | El campo `checksum` (SHA-256 del fuente) en `/` y `/health` | `off` |
-| `TP_RATE_LIMIT` | El límite de peticiones por IP y las respuestas `429` | `off` |
+Las dos apps leen y escriben sobre **la misma base**, un contenedor de Redis. El alta va en un
+script Lua que hace el chequeo de duplicado, el `INCR`, el `HSET`, el `ZADD` y el `SET` en **una
+sola operación atómica**: entre comprobar que el legajo no está y escribirlo, otra réplica puede
+colarse con el mismo; y entre pedir el `id` y usarlo, otra puede pedir el mismo.
 
-Se encienden con `on`, `1`, `true`, `si` o `sí`; cualquier otro valor las deja apagadas.
+Verificado con **25 altas simultáneas del mismo legajo** (exactamente 1 alta y 24 conflictos) y
+**40 concurrentes desde las dos réplicas** (ids del 1 al 40, sin huecos ni repetidos).
 
-```bash
-# Comportamiento del contrato — la respuesta es indistinguible de App Java
-python3 Clase01/app.py 8080
+Eso es lo que la base resuelve sin que se vea: la pregunta 6 del enunciado. Sin esa atomicidad
+haría falta exclusión mutua entre casas, que es un problema bastante más grande.
 
-# Con las dos extensiones encendidas, para mostrarlas en la demo
-TP_CHECKSUM=on TP_RATE_LIMIT=on python3 Clase01/app.py 8080
+### La bitácora
+
+Cada réplica escribe **una línea por RPC atendido** en el disco local del nodo — no en la base:
+
+```
+2026-09-06T18:04:13-03:00 | python@casa-tomas | CrearPersona | OK | id=4
+2026-09-06T18:04:14-03:00 | python@casa-tomas | CrearPersona | ALREADY_EXISTS | -
 ```
 
-Cada extensión encendida deja constancia en el arranque, así que se ve de un vistazo con qué
-configuración quedó levantada una réplica:
-
-```
-[rate-limit] 100 peticiones cada 60s por IP, backend 'memoria', todas las rutas (extensión propia, fuera del contrato)
-[checksum] expuesto en / y /health (extensión propia, fuera del contrato)
-```
+**Un archivo por réplica** (`logs/app-N/bitacora-<HOST_NAME>.log`): dos réplicas en el mismo nodo
+escribiendo el mismo archivo no se pueden distinguir después, y distinguirlas es justo lo que la
+auditoría de la Etapa 2 tiene que demostrar.
 
 ### Variables de entorno
 
 | Variable | Para qué | Default |
 | :--- | :--- | :--- |
 | `PORT` | Puerto de escucha. El primer argumento de línea de comandos le gana. | `8080` |
-| `HOST_NAME` | Identidad de la instancia, en el campo `host` de `GET /`. | *hostname* de la máquina |
-| `TP_CHECKSUM` | Enciende la extensión del checksum. | `off` |
-| `TP_RATE_LIMIT` | Enciende la extensión del rate limiting. | `off` |
-| `TP_RATE_LIMIT_MAX` | Peticiones permitidas por ventana. | `100` |
-| `TP_RATE_LIMIT_WINDOW` | Duración de la ventana, en segundos. | `60` |
-| `TP_REDIS_URL` | **Base compartida de `/personas`** y, además, contador del rate limiting compartido entre réplicas. | vacío → `/personas` responde `503` y el contador es local |
+| `HOST_NAME` | Identidad de la instancia. Da nombre al archivo de bitácora. | *hostname* de la máquina |
+| `CASA` | Nodo donde corre. Va en el segundo campo de la bitácora. | `casa-desconocida` |
+| `TP_REDIS_URL` | **Base compartida** y contador del rate limiting. | vacío → los RPC de personas dan `UNAVAILABLE` |
+| `TP_WORKERS` | Hebras que atienden RPCs a la vez. | `10` |
+| `TP_LOGS` | Directorio de la bitácora. | `logs` |
+| `TP_CHECKSUM` | Enciende el checksum. | `off` |
+| `TP_RATE_LIMIT` | Enciende el rate limiting. | `off` |
+| `TP_RATE_LIMIT_MAX` / `_WINDOW` | Peticiones por ventana y duración en segundos. | `100` / `60` |
 
-`TP_REDIS_URL` lleva la contraseña de Redis adentro, así que **no se versiona**: va en el `.env`
-de cada nodo, que está en el `.gitignore`. La app nunca la escribe entera en el log: recorta el
-usuario y la contraseña antes de imprimirla.
+`TP_REDIS_URL` lleva la contraseña adentro, así que **no se versiona**: va en el `.env` de cada
+nodo (ver [`.env.example`](.env.example)), que está en el `.gitignore`. La app nunca la escribe
+entera en el log: recorta usuario y contraseña antes de imprimirla.
+
+### La red entre casas
+
+**Tailscale.** Un único tailnet donde entran las tres casas, así el balanceador alcanza a las
+réplicas por nombre (`casa-tomas:8101`) sin abrir puertos al mundo ni depender de túneles con
+address variable. El enunciado lo habilita explícitamente (*"túnel por casa, malla/VPN, lo que
+elijan"*). ngrok queda para una sola cosa: exponer el balanceador a internet.
 
 ### Estado
 
 | | Punto | Estado |
 | :--- | :--- | :--- |
-| ✅ | Contrato acordado y App Python al día con la v1.3 | Verificado corriendo las dos apps lado a lado |
-| ✅ | `GET /slow` y graceful shutdown | Vienen de la Clase 1; se reusan para probar el deploy sin downtime |
-| ✅ | `/personas` sobre Redis, con la validación y la matriz de casos de §6 | Alta atómica por script Lua: verificado con 25 altas simultáneas del mismo legajo (1 × `201`, 24 × `409`) y 40 concurrentes con `id` consecutivos sin huecos |
-| ⬜ | Bitácora a disco, variable `CASA` (§8 del contrato) | Pendiente |
-| ⬜ | `deploy.sh` blue-green con rollback | Pendiente |
-| ⬜ | Dónde corre Redis y qué red une las casas | A definir con el grupo |
+| ✅ | Contrato v2.0 acordado y `contrato.proto` definido | |
+| ✅ | Servidor gRPC con los seis RPC + health estándar + reflection | Verificado contra los contenedores |
+| ✅ | `CrearPersona` / `ListarPersonas` sobre Redis, con validación y alta atómica | Verificado con altas concurrentes desde dos réplicas |
+| ✅ | Graceful shutdown con drenado | Verificado mandando `SIGTERM` con un RPC lento en vuelo |
+| ✅ | Bitácora a disco, un archivo por réplica | |
+| ✅ | Dos réplicas y la base en contenedores, las tres `healthy` | |
+| ⬜ | `deploy.sh` blue-green con abort y rollback | Falta definir con Plataforma cómo se pide la conmutación |
+| ⬜ | El verificador, y a qué equipo verificamos | |
+| ⬜ | Diagramas por etapa de la Clase 2 | |
+| ⬜ | En qué casa corre la base y quién la opera | A definir con el grupo |
 
 ---
 
@@ -500,6 +452,8 @@ Tres huecos de la consigna que encontramos montando esto.
 
 ---
 
+---
+
 ## Preguntas de Análisis Distribuidos
 
 El puerto TCP de producción es el recurso crítico y el único árbitro físico que garantiza la exclusión mutua es el kernel del servidor al procesar la syscall `bind()`, rebotando cualquier intento concurrente con el error `Address already in use`. En la arquitectura de esta tarea la exclusión mutua es de carácter centralizado, ya que no existe un protocolo de consenso distribuido entre las casas de los integrantes y toda la contención se resuelve en el único servidor de Plataforma. La coordinación entre equipos fuera del sistema operativo se sostiene de forma puramente social mediante acuerdos por canal de chat.
@@ -509,6 +463,8 @@ Si dos equipos intentan desplegar al mismo tiempo se produce una condición de c
 El pipeline manual carece de atomicidad y transaccionalidad, por lo que una caída de conectividad en pleno despliegue deja al sistema en un estado inconsistente. Si la falla ocurre durante la transferencia del artefacto el archivo queda incompleto en disco pero el servicio anterior continúa respondiendo. Si el corte sucede entre el frenado de la app anterior y la inicialización de la nueva, el puerto queda libre sin ningún proceso escuchando y se genera una denegación de servicio total. Si la conexión cae durante la ejecución y la app no fue desvinculada del pseudo-terminal remoto, la señal enviada por la sesión SSH terminada mata al proceso nuevo.
 
 Los pasos que evidenciaron la necesidad de automatización fueron stop, kill process, y levantar el proceso con controles de exclusión mutua.
+
+---
 
 ---
 

@@ -1,0 +1,77 @@
+# Levanta el servicio completo de la App Python: la base compartida y dos réplicas.
+#
+#   docker compose up --build -d
+#   docker compose ps          # las dos réplicas tienen que quedar (healthy)
+#   docker compose down -v
+#
+# En el despliegue real cada casa levanta sus réplicas y la base corre en un solo
+# nodo: ahí se apunta TP_REDIS_URL al nombre de Tailscale de esa casa y se comenta
+# el servicio redis de este archivo.
+
+services:
+  # La base compartida. En el despliegue hay UNA sola para las dos apps: si cada
+  # equipo levantara la suya, un alta hecha por Python no la vería Java y el
+  # reparto del balanceador rompería el servicio (CONTRATO.md §6).
+  redis:
+    image: redis:8-alpine
+    # appendonly: la cadena de datos sobrevive a un reinicio del contenedor. Sin
+    # esto, matar la base es perder todo lo cargado en la demo.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-datos:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  app-1:
+    build: .
+    image: sdypp-app-python:latest
+    environment:
+      # Identidad de la instancia: es lo que distingue a las dos réplicas en el
+      # campo host y en el nombre del archivo de bitácora.
+      HOST_NAME: ${HOST_NAME_1:-casa-tomas-1}
+      CASA: ${CASA:-casa-tomas}
+      TP_REDIS_URL: ${TP_REDIS_URL:-redis://redis:6379/0}
+    ports:
+      - "8101:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      # La bitácora vive en el disco local del nodo, no en la base ni dentro del
+      # contenedor: tiene que sobrevivir al deploy que reemplaza la imagen.
+      #
+      # Crear los directorios ANTES de levantar:
+      #   mkdir -p logs/app-1 logs/app-2
+      # Si no existen, los crea Docker como root y el proceso —que corre sin
+      # privilegios— no puede escribir adentro.
+      - ./logs/app-1:/app/logs
+    # Mayor que los 4 s de Lenta más el grace del servidor: si Docker manda
+    # SIGKILL antes, el graceful shutdown no llega a drenar nada.
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+  # Sin `build`: usa la imagen que construye app-1. Si las dos la construyeran,
+  # compose las arma en paralelo y las dos intentan escribir el mismo tag, que
+  # falla con "image already exists".
+  app-2:
+    image: sdypp-app-python:latest
+    environment:
+      HOST_NAME: ${HOST_NAME_2:-casa-tomas-2}
+      CASA: ${CASA:-casa-tomas}
+      TP_REDIS_URL: ${TP_REDIS_URL:-redis://redis:6379/0}
+    ports:
+      - "8102:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs/app-2:/app/logs
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+volumes:
+  redis-datos:

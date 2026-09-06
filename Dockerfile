@@ -62,7 +62,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
 
 # Docker manda SIGTERM al parar; el proceso lo atrapa, se declara NOT_SERVING y
 # drena los RPC en vuelo. El stop_grace_period del compose tiene que ser mayor que
-# los 4 s de Lenta, o llega el SIGKILL en medio del drenado.
+# el grace del servidor, o llega el SIGKILL en medio del drenado.
 STOPSIGNAL SIGTERM
 
 CMD ["python", "app.py"]

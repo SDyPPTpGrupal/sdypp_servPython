@@ -1,4 +1,4 @@
-"""App Python — servidor gRPC del contrato v2.0.
+"""App Python — servidor gRPC del contrato v2.1.
 
 El esquema formal está en contrato.proto; las reglas que el .proto no puede
 expresar (validación, orden de los chequeos, semántica de los errores) están en
@@ -10,16 +10,13 @@ Se ejecuta desde la raíz del repositorio:
     python3 Clase01/app.py 8080
 """
 
-import hashlib
 import os
 import platform
 import signal
 import socket
 import sys
 import threading
-import time
 import urllib.parse
-import uuid
 from concurrent import futures
 from datetime import datetime
 
@@ -52,26 +49,10 @@ CASA = os.environ.get("CASA", "casa-desconocida")
 # Precisión de segundos, sin fracción: el formato es contrato.
 ARRANCADO = datetime.now().astimezone().replace(microsecond=0).isoformat()
 
-# Hebras que atienden RPCs a la vez. Importa: Lenta duerme 4 s, así que con pocas
-# hebras un puñado de peticiones lentas dejan al resto esperando.
+# Hebras que atienden RPCs a la vez.
 WORKERS = int(os.environ.get("TP_WORKERS", 10))
 
-
-def calcular_checksum() -> str:
-    """SHA-256 del propio archivo fuente, en tiempo de arranque."""
-    try:
-        with open(os.path.abspath(__file__), "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except Exception as e:
-        return f"error: {e}"
-
-
-CHECKSUM = calcular_checksum()
-
-
-def _encendido(variable: str) -> bool:
-    """Lee una variable de entorno como interruptor. Apagado si no está definida."""
-    return os.environ.get(variable, "off").strip().lower() in ("on", "1", "true", "si", "sí")
+REDIS_URL = os.environ.get("TP_REDIS_URL", "")
 
 
 def _url_sin_credenciales(url: str) -> str:
@@ -92,126 +73,10 @@ def _ahora_iso() -> str:
     return datetime.now().astimezone().replace(microsecond=0).isoformat()
 
 
-# --- Extensiones propias, fuera del contrato ---
-# Ninguna de las dos existe en la App Java, así que con el balanceador repartiendo
-# entre réplicas de los dos lenguajes el servicio respondería distinto según quién
-# atendió. Van apagadas por defecto (CONTRATO.md §13).
-CHECKSUM_EXPUESTO = _encendido("TP_CHECKSUM")
-
-RATE_LIMIT_ACTIVO = _encendido("TP_RATE_LIMIT")
-RATE_LIMIT_MAX = int(os.environ.get("TP_RATE_LIMIT_MAX", 100))
-RATE_LIMIT_WINDOW = int(os.environ.get("TP_RATE_LIMIT_WINDOW", 60))
-REDIS_URL = os.environ.get("TP_REDIS_URL", "")
-
-
-class LimitadorEnMemoria:
-    """Ventana deslizante en la RAM del proceso.
-
-    Limitación conocida: el contador es local a la instancia. Con varias réplicas
-    detrás del balanceador cada una lleva su propia cuenta, así que el límite
-    efectivo pasa a ser RATE_LIMIT_MAX por réplica y no por servicio. Es la
-    respuesta a la pregunta 5 del enunciado: esto es lo que se rompe con estado en
-    memoria.
-    """
-
-    nombre = "memoria"
-
-    def __init__(self):
-        self._historial = {}
-        self._lock = threading.Lock()
-
-    def excede(self, cliente: str) -> bool:
-        ahora = time.time()
-        # El servidor atiende cada RPC en su propia hebra: sin el lock, dos hebras
-        # pueden leer el mismo historial y dejar pasar de más.
-        with self._lock:
-            vigentes = [t for t in self._historial.get(cliente, []) if ahora - t < RATE_LIMIT_WINDOW]
-            if len(vigentes) >= RATE_LIMIT_MAX:
-                self._historial[cliente] = vigentes
-                return True
-            vigentes.append(ahora)
-            self._historial[cliente] = vigentes
-            return False
-
-
-# Consultar el contador y registrar la petición tienen que ser una sola operación
-# atómica: si se resuelve en dos viajes a Redis, dos réplicas pueden leer el mismo
-# conteo y ambas dejar pasar la petición que debía cortarse. Redis corre el script
-# entero sin intercalar comandos de otros clientes. Es el mismo problema de
-# exclusión mutua del lock de arriba, pero entre procesos que no comparten memoria.
-_LUA_VENTANA_DESLIZANTE = """
-local clave = KEYS[1]
-local ahora = tonumber(ARGV[1])
-local ventana = tonumber(ARGV[2])
-local maximo = tonumber(ARGV[3])
-local miembro = ARGV[4]
-
-redis.call('ZREMRANGEBYSCORE', clave, 0, ahora - ventana)
-if redis.call('ZCARD', clave) >= maximo then
-  return 1
-end
-redis.call('ZADD', clave, ahora, miembro)
-redis.call('EXPIRE', clave, ventana)
-return 0
-"""
-
-
-class LimitadorRedis:
-    """Ventana deslizante compartida por todas las réplicas del servicio."""
-
-    nombre = "redis"
-
-    def __init__(self, url: str):
-        import redis  # dependencia externa, ver requirements.txt
-
-        self._cliente = redis.Redis.from_url(url, socket_timeout=1, socket_connect_timeout=1)
-        self._cliente.ping()  # falla acá si no hay Redis, no en el primer RPC
-        self._script = self._cliente.register_script(_LUA_VENTANA_DESLIZANTE)
-
-    def excede(self, cliente: str) -> bool:
-        ahora = time.time()
-        # El miembro tiene que ser único: dos peticiones en el mismo instante
-        # comparten score y el sorted set descartaría una de las dos.
-        miembro = f"{ahora}:{uuid.uuid4().hex}"
-        return bool(self._script(
-            keys=[f"ratelimit:{cliente}"],
-            args=[ahora, RATE_LIMIT_WINDOW, RATE_LIMIT_MAX, miembro],
-        ))
-
-
-class LimitadorApagado:
-    """Objeto nulo para cuando la extensión está apagada: nunca excede."""
-
-    nombre = "apagado"
-
-    def excede(self, cliente: str) -> bool:
-        return False
-
-
-def crear_limitador():
-    if not RATE_LIMIT_ACTIVO:
-        return LimitadorApagado()
-    if not REDIS_URL:
-        print("[rate-limit] contador local de esta instancia (sin TP_REDIS_URL)")
-        return LimitadorEnMemoria()
-    try:
-        limitador = LimitadorRedis(REDIS_URL)
-        print(f"[rate-limit] contador compartido en {_url_sin_credenciales(REDIS_URL)}")
-        return limitador
-    except Exception as e:
-        # Preferimos degradar antes que no levantar: un Redis caído no debería
-        # dejar la réplica afuera, pero tiene que quedar dicho en el log.
-        print(f"[rate-limit] Redis no disponible ({e}); se usa el contador local de esta instancia")
-        return LimitadorEnMemoria()
-
-
-LIMITADOR = crear_limitador()
-
-
 # --- Estado compartido: personas sobre la base (CONTRATO.md §6) ---
 # Los datos no viven en la memoria de ninguna instancia: las réplicas quedan
 # stateless, cualquiera puede atender cualquier RPC y la que se muere no se lleva
-# nada consigo.
+# nada consigo. La base corre en una máquina aparte, compartida con la App Java.
 
 LEGAJO_MIN = 1
 LEGAJO_MAX = 2147483647  # el tope de int32, que es el tipo del campo en el .proto
@@ -347,7 +212,7 @@ def validar_persona(nombre: str, legajo: int):
     return limpio, None
 
 
-# --- Bitácora (CONTRATO.md §9) ---
+# --- Bitácora (CONTRATO.md §8) ---
 # Una línea por RPC atendido, en el disco local del nodo. Un archivo por réplica:
 # dos réplicas en el mismo nodo escribiendo el mismo archivo no se pueden
 # distinguir después, y distinguirlas es lo que la auditoría tiene que demostrar.
@@ -377,7 +242,7 @@ def bitacora(rpc: str, codigo: str, identificador=None):
 
 
 class Servicio(pb_grpc.ServicioServicer):
-    """Los seis RPC del contrato."""
+    """Los cinco RPC del contrato."""
 
     def Identidad(self, request, context):
         bitacora("Identidad", "OK")
@@ -403,23 +268,6 @@ class Servicio(pb_grpc.ServicioServicer):
                                 "se requiere el campo ping", "Echo")
         bitacora("Echo", "OK")
         return pb.PongRespuesta(pong=request.ping, servido_por=APP_NAME, version=VERSION)
-
-    def Lenta(self, request, context):
-        """RPC deliberadamente lento.
-
-        Sirve para dos cosas: probar que el graceful shutdown espera a los RPC en
-        vuelo, y tener tráfico en curso durante el blue-green para mostrar que no
-        se pierde ninguna petición.
-        """
-        print("[Lenta] procesando (4 segundos)...")
-        time.sleep(4)
-        bitacora("Lenta", "OK")
-        return pb.RespuestaLenta(
-            status="ok",
-            mensaje="Petición lenta completada a pesar de recibir la orden de apagado.",
-            app=APP_NAME,
-            version=VERSION,
-        )
 
     def ListarPersonas(self, request, context):
         if REPOSITORIO is None:
@@ -475,58 +323,14 @@ class Servicio(pb_grpc.ServicioServicer):
                             "base de datos no disponible", rpc)
 
 
-class InterceptorRateLimit(grpc.ServerInterceptor):
-    """Aplica el límite antes de que el RPC llegue al servicio.
-
-    Va como interceptor y no dentro de cada método por la misma razón por la que en
-    HTTP iba antes del ruteo: si no, una ráfaga contra un método inexistente no
-    quedaría limitada. Cubre todos los RPC, Salud incluido — un chequeo de salud
-    sin límite es el más fácil de usar para terminar de tirar abajo un servicio ya
-    degradado, y además suele ser el más público.
-    """
-
-    def __init__(self):
-        self._rechazo = grpc.unary_unary_rpc_method_handler(self._rechazar)
-
-    def _rechazar(self, request, context):
-        context.abort(
-            grpc.StatusCode.RESOURCE_EXHAUSTED,
-            f"Se superó el límite de {RATE_LIMIT_MAX} peticiones cada {RATE_LIMIT_WINDOW} segundos.",
-        )
-
-    def intercept_service(self, continuation, handler_call_details):
-        if LIMITADOR.excede(self._cliente(handler_call_details)):
-            return self._rechazo
-        return continuation(handler_call_details)
-
-    @staticmethod
-    def _cliente(handler_call_details) -> str:
-        """Identidad del cliente, de la metadata x-forwarded-for.
-
-        Detrás del balanceador todos los RPC llegan desde la misma máquina, así que
-        sin esa metadata el límite trataría a todos los clientes como uno solo. gRPC
-        normaliza las claves a minúscula. Si Plataforma todavía no la propaga, todo
-        cae en el mismo cubo y queda dicho acá: es una limitación conocida, no un
-        descuido (CONTRATO.md §11.4).
-        """
-        for clave, valor in (handler_call_details.invocation_metadata or ()):
-            if clave == "x-forwarded-for":
-                return valor.split(",")[0].strip()
-        return "desconocido"
-
-
 def servir(puerto: int = 8080):
-    # El proceso arranca con `docker run` o con nohup, y ahí stdout no es una
-    # terminal: Python lo bufferiza por bloques y el log queda vacío hasta juntar
-    # varios KB. Sin esto, el banner y los avisos del apagado no aparecen cuando
-    # hacen falta, que es justo mientras se mira el log para ver si el deploy salió.
+    # El proceso arranca con `docker run`, y ahí stdout no es una terminal: Python
+    # lo bufferiza por bloques y el log queda vacío hasta juntar varios KB. Sin
+    # esto, el banner y los avisos del apagado no aparecen cuando hacen falta, que
+    # es justo mientras se mira el log para ver si el deploy salió bien.
     sys.stdout.reconfigure(line_buffering=True)
 
-    interceptores = [InterceptorRateLimit()] if RATE_LIMIT_ACTIVO else []
-    servidor = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=WORKERS),
-        interceptors=interceptores,
-    )
+    servidor = grpc.server(futures.ThreadPoolExecutor(max_workers=WORKERS))
     pb_grpc.add_ServicioServicer_to_server(Servicio(), servidor)
 
     # Health checking estándar de gRPC, además del RPC Salud del contrato: es lo que
@@ -549,14 +353,8 @@ def servir(puerto: int = 8080):
     servidor.add_insecure_port(f"0.0.0.0:{puerto}")
     servidor.start()
 
-    print(f"Servidor gRPC en 0.0.0.0:{puerto} (PID: {os.getpid()}) "
-          f"(SHA256: {CHECKSUM[:12]}...) (Arrancado: {ARRANCADO})")
+    print(f"Servidor gRPC en 0.0.0.0:{puerto} (PID: {os.getpid()}) (Arrancado: {ARRANCADO})")
     print(f"[instancia] {APP_NAME}@{CASA} host={HOST} version={VERSION} workers={WORKERS}")
-    if RATE_LIMIT_ACTIVO:
-        print(f"[rate-limit] {RATE_LIMIT_MAX} peticiones cada {RATE_LIMIT_WINDOW}s por cliente, "
-              f"backend '{LIMITADOR.nombre}', todos los RPC (extensión propia, fuera del contrato)")
-    if CHECKSUM_EXPUESTO:
-        print(f"[checksum] {CHECKSUM} (extensión propia, fuera del contrato)")
     if REPOSITORIO is None:
         print("[personas] sin TP_REDIS_URL: los RPC de personas responden UNAVAILABLE")
     else:
@@ -577,9 +375,9 @@ def servir(puerto: int = 8080):
     signal.signal(signal.SIGTERM, detener)
 
     apagado.wait()
-    # stop() deja de aceptar RPCs nuevos y espera hasta `grace` a los en curso.
-    # Tiene que superar los 4 s de Lenta, o se cortarían las peticiones en vuelo
-    # que este apagado existe para no perder.
+    # stop() deja de aceptar RPCs nuevos y espera hasta `grace` a los en curso: sin
+    # eso, las peticiones que estaban a mitad de camino se cortarían justo durante
+    # el deploy, que es cuando el servicio tiene que seguir respondiendo.
     servidor.stop(grace=10).wait()
     print("[ Graceful Shutdown ] Puerto liberado y servidor detenido exitosamente.")
 

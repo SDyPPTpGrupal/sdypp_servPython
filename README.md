@@ -76,14 +76,13 @@ grpcurl -plaintext localhost:8101 sdypp.Servicio/Identidad
 
 El esquema formal está en **[`contrato.proto`](contrato.proto)**; las reglas que el `.proto` no
 puede expresar —validación, orden de los chequeos, semántica de los errores— están en
-**[`CONTRATO.md`](CONTRATO.md) v2.0**. Ante una diferencia, **manda el contrato**, no este README.
+**[`CONTRATO.md`](CONTRATO.md) v2.1**. Ante una diferencia, **manda el contrato**, no este README.
 
 | RPC | Qué hace |
 | :--- | :--- |
 | `Identidad` | Metadatos de la instancia: app, lenguaje, equipo, versión, host y arranque. |
 | `Salud` | Chequeo de salud del servicio. |
 | `Echo` | Recibe `ping` y responde `pong`, con `servido_por` y `version`. |
-| `Lenta` | RPC deliberadamente lento (4 s) para probar el **graceful shutdown** y el deploy sin downtime. |
 | `ListarPersonas` | Lo guardado en la base compartida, ordenado por `id`. |
 | `CrearPersona` | Alta. El `id` **lo asigna la base**, nunca la app. |
 
@@ -208,126 +207,14 @@ versión. Eso implica dos procesos vivos por réplica, y es a propósito.
 
 ---
 
-## 🌟 Aportes Propios Justificados
+## 🌟 Aportes Propios
 
-> ℹ️ **Ninguno de los tres entró al contrato común.** `Lenta` sí, porque las dos apps la necesitan
-> para probar el drenado. El **checksum** y el **rate limiting** quedaron afuera porque App Java no
-> los tiene: con el balanceador repartiendo entre las dos, el servicio respondería distinto según
-> quién atendió. Siguen en el código detrás de un interruptor, **apagados por defecto**:
->
-> ```bash
-> TP_CHECKSUM=on TP_RATE_LIMIT=on python3 Clase01/app.py 8080
-> ```
+⬜ **Pendiente.** El enunciado pide al menos tres, justificados.
 
----
-
-### Aporte 1: Graceful Shutdown & Drenado de RPCs
-
-#### ¿En qué consiste?
-
-Un manejador de `SIGTERM` y `SIGINT` que apaga el servidor en dos tiempos, en vez de morirse de
-golpe:
-
-1. **Se declara `NOT_SERVING`** en el health checking estándar. El balanceador lo ve en su próximo
-   chequeo y la saca de rotación: deja de mandarle RPCs nuevos *mientras todavía está atendiendo
-   los que tiene*.
-2. **`server.stop(grace=10)`**: deja de aceptar RPCs nuevos y espera hasta 10 segundos a que
-   terminen los que están en vuelo.
-3. Recién ahí libera el puerto y termina el proceso.
-
-El orden importa: sin el paso 1, el balanceador sigue derivando peticiones a una réplica que ya
-está cerrando, y esas fallan.
-
-#### ¿Cómo probarlo?
-
-```bash
-# 1. Lanzar un RPC lento (tarda 4 segundos)
-python3 Clase01/cliente.py localhost:8101 lenta &
-
-# 2. Dentro de esos 4 segundos, mandarle SIGTERM al contenedor
-docker compose stop app-1
-```
-
-**Resultado:** el cliente **no se corta**. Espera sus 4 segundos y recibe la respuesta completa.
-En el log del contenedor:
-
-```text
-[Lenta] procesando (4 segundos)...
-[ Graceful Shutdown ] Recibida SIGTERM. Marcando NOT_SERVING y drenando...
-2026-09-06T18:04:30-03:00 | python@casa-tomas | Lenta | OK | -
-[ Graceful Shutdown ] Puerto liberado y servidor detenido exitosamente.
-```
-
-El `stop_grace_period` del compose está en 15 s **a propósito**: tiene que ser mayor que los 4 s de
-`Lenta` más el margen del servidor, o Docker manda `SIGKILL` en medio del drenado y todo esto no
-sirve de nada.
-
----
-
-### Aporte 2: Hash de Integridad del Código en Tiempo de Ejecución (SHA-256)
-
-#### ¿En qué consiste?
-
-Al arrancar, la aplicación lee su propio archivo fuente, calcula su SHA-256 con `hashlib` y lo
-informa. Con `TP_CHECKSUM=on` lo imprime en el banner de arranque.
-
-#### ¿Para qué sirve, ahora que hay réplicas?
-
-Dos réplicas pueden informar las dos `version: 2` y estar corriendo código distinto: un `scp` que se
-cortó, una imagen vieja en caché, alguien que editó el archivo a mano en el servidor. **El número de
-versión no detecta eso; el hash sí.**
-
-```bash
-docker compose logs app-1 | grep checksum
-docker compose logs app-2 | grep checksum
-sha256sum Clase01/app.py        # tiene que coincidir con los dos
-```
-
-No reemplaza a `version`: **detecta cuándo `version` miente**. Es la respuesta directa a una de las
-picantes del enunciado, la de la instancia que responde bien pero devuelve basura.
-
----
-
-### Aporte 3: Rate Limiting con Ventana Deslizante
-
-#### ¿En qué consiste?
-
-Un **interceptor** de gRPC que limita las peticiones por cliente en una ventana deslizante y
-responde `RESOURCE_EXHAUSTED` al superar el límite. Va como interceptor y no dentro de cada método
-por la misma razón por la que en HTTP iba antes del ruteo: si no, una ráfaga contra un método
-inexistente no quedaría limitada.
-
-Cubre **todos los RPC, `Salud` incluido**. Un chequeo de salud sin límite es el más fácil de usar
-para terminar de tirar abajo un servicio ya degradado, y además suele ser el más público: el resto
-de los métodos puede no estar difundido.
-
-#### El contador vive en Redis, no en memoria
-
-Es el punto que importa con réplicas. Con el contador en la RAM del proceso, cada réplica lleva su
-propia cuenta y el límite efectivo se multiplica por la cantidad de réplicas: un límite de 100
-pasa a ser de 200 con dos. Por eso el contador va a Redis, con un script Lua que hace el chequeo y
-el alta en **una sola operación atómica** — si se resolviera en dos viajes, dos réplicas podrían
-leer el mismo conteo y ambas dejar pasar la petición que debía cortarse.
-
-Es el mismo problema de exclusión mutua que el lock entre hebras, pero entre procesos que no
-comparten memoria. Y es la respuesta a la pregunta 5 del enunciado: *¿qué se rompe con un contador
-en memoria?* Esto.
-
-#### ¿Cómo probarlo?
-
-```bash
-TP_RATE_LIMIT=on TP_RATE_LIMIT_MAX=5 TP_RATE_LIMIT_WINDOW=10 \
-  TP_REDIS_URL=redis://127.0.0.1:6379/0 docker compose up -d
-
-# Alternar entre las dos réplicas, como repartiría el balanceador
-for i in $(seq 1 8); do
-  python3 Clase01/cliente.py localhost:8101 salud > /dev/null 2>&1; echo "A $?"
-  python3 Clase01/cliente.py localhost:8102 salud > /dev/null 2>&1; echo "B $?"
-done
-```
-
-Resultado esperado: **cinco respuestas en total entre ambas**, y `RESOURCE_EXHAUSTED` desde
-cualquiera de las dos a partir de la sexta — no cinco por cada una.
+Los tres de la Clase 1 —graceful shutdown, checksum del fuente y rate limiting con ventana
+deslizante— **salieron del proyecto por decisión del grupo**. El graceful shutdown sigue
+implementado, porque el blue-green lo necesita para no cortar peticiones a mitad de camino, pero ya
+no hay un RPC lento con que evidenciarlo en la demo.
 
 ---
 
@@ -351,7 +238,8 @@ del timestamp de arranque hasta qué devolvía `echo` sin `ping`. Están todas r
 | 1.0 – 1.1 | Las ocho divergencias; `/personas`, bitácora y rate limiting como extensión |
 | 1.2 | `equipo` estructurado, `mensaje` texto plano, `checksum` fuera del contrato |
 | 1.3 | Validación de `/personas`, el **orden** de los chequeos y la matriz de casos borde |
-| **2.0** | **El transporte pasa de HTTP/JSON a gRPC + Protobuf** |
+| 2.0 | El transporte pasa de HTTP/JSON a gRPC + Protobuf |
+| **2.1** | **Salen `Lenta`, el checksum y el rate limiting** |
 
 ### Por qué gRPC cambia más que el formato
 
@@ -399,12 +287,9 @@ auditoría de la Etapa 2 tiene que demostrar.
 | `PORT` | Puerto de escucha. El primer argumento de línea de comandos le gana. | `8080` |
 | `HOST_NAME` | Identidad de la instancia. Da nombre al archivo de bitácora. | *hostname* de la máquina |
 | `CASA` | Nodo donde corre. Va en el segundo campo de la bitácora. | `casa-desconocida` |
-| `TP_REDIS_URL` | **Base compartida** y contador del rate limiting. | vacío → los RPC de personas dan `UNAVAILABLE` |
+| `TP_REDIS_URL` | **Base compartida**, en la máquina de Nomico. | vacío → los RPC de personas dan `UNAVAILABLE` |
 | `TP_WORKERS` | Hebras que atienden RPCs a la vez. | `10` |
 | `TP_LOGS` | Directorio de la bitácora. | `logs` |
-| `TP_CHECKSUM` | Enciende el checksum. | `off` |
-| `TP_RATE_LIMIT` | Enciende el rate limiting. | `off` |
-| `TP_RATE_LIMIT_MAX` / `_WINDOW` | Peticiones por ventana y duración en segundos. | `100` / `60` |
 
 `TP_REDIS_URL` lleva la contraseña adentro, así que **no se versiona**: va en el `.env` de cada
 nodo (ver [`.env.example`](.env.example)), que está en el `.gitignore`. La app nunca la escribe
@@ -422,15 +307,16 @@ elijan"*). ngrok queda para una sola cosa: exponer el balanceador a internet.
 | | Punto | Estado |
 | :--- | :--- | :--- |
 | ✅ | Contrato v2.0 acordado y `contrato.proto` definido | |
-| ✅ | Servidor gRPC con los seis RPC + health estándar + reflection | Verificado contra los contenedores |
+| ✅ | Servidor gRPC con los cinco RPC + health estándar + reflection | Verificado contra los contenedores |
 | ✅ | `CrearPersona` / `ListarPersonas` sobre Redis, con validación y alta atómica | Verificado con altas concurrentes desde dos réplicas |
-| ✅ | Graceful shutdown con drenado | Verificado mandando `SIGTERM` con un RPC lento en vuelo |
+| ✅ | Graceful shutdown con drenado | Avisa `NOT_SERVING` y espera a los RPC en vuelo |
 | ✅ | Bitácora a disco, un archivo por réplica | |
-| ✅ | Dos réplicas y la base en contenedores, las tres `healthy` | |
+| ✅ | Contenedores: compose de desarrollo (base + dos réplicas) y `docker-compose.nodo.yml` para el despliegue real | |
+| ⬜ | Los tres aportes propios | Los de la Clase 1 salieron del proyecto |
 | ⬜ | `deploy.sh` blue-green con abort y rollback | Falta definir con Plataforma cómo se pide la conmutación |
 | ⬜ | El verificador, y a qué equipo verificamos | |
 | ⬜ | Diagramas por etapa de la Clase 2 | |
-| ⬜ | En qué casa corre la base y quién la opera | A definir con el grupo |
+| ✅ | En qué casa corre la base | En la máquina de Nomico, según el diagrama de la Etapa 2 |
 
 ---
 

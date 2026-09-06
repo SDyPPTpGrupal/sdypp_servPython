@@ -1,6 +1,6 @@
 # Contrato de servicio — App Java ↔ App Python
 
-**Versión 2.0 — 06/09/2026 · gRPC + Protobuf**
+**Versión 2.1 — 06/09/2026 · gRPC + Protobuf**
 
 Especificación de lo que las dos implementaciones tienen que responder **igual**, para que sean
 intercambiables detrás del balanceador del equipo Plataforma.
@@ -11,10 +11,10 @@ intercambiables detrás del balanceador del equipo Plataforma.
 
 > ⚠️ **La v2.0 es un cambio incompatible.** El servicio deja de hablar HTTP/JSON y pasa a
 > **gRPC sobre HTTP/2 con Protobuf**. Un cliente de la v1.3 no puede hablar con un servidor v2.0.
-> Las consecuencias para los otros dos equipos están en §8 y §11: no son un detalle de
+> Las consecuencias para los otros dos equipos están en §7 y §10: no son un detalle de
 > implementación, son trabajo que hay que negociar antes de escribir código.
 
-**Estado de implementación:** App Python ⬜ migrando · App Java ⬜ pendiente (ver §8)
+**Estado de implementación:** App Python ✅ al día con la v2.1 · App Java ⬜ pendiente (ver §7)
 
 El esquema formal vive en **[`contrato.proto`](contrato.proto)**. Este documento especifica lo que
 el `.proto` no puede expresar: validación, orden de los chequeos, semántica de los errores y qué
@@ -30,7 +30,7 @@ hace cada implementación cuando algo falla.
 | Serialización | **Protobuf 3** (`contrato.proto`) |
 | Paquete proto | `sdypp` |
 | Servicio | `sdypp.Servicio` |
-| Canal | **Inseguro** (sin TLS): el cifrado lo pone Tailscale por debajo (ver §11) |
+| Canal | **Inseguro** (sin TLS): el cifrado lo pone Tailscale por debajo (ver §10) |
 | Puerto | Primer argumento de línea de comandos; si no, variable `PORT`; default **8080** |
 | Identidad de la instancia | Variable de entorno **`HOST_NAME`** |
 | Nodo donde corre | Variable de entorno **`CASA`** |
@@ -53,7 +53,7 @@ No es sólo "otro formato". Tres cosas dejan de funcionar como antes:
    liberado.
 2. **Se pierde la distinción entre "ausente" y "vacío".** En proto3 un `string` que no se manda
    llega como `""` y un `int32` como `0`: no hay forma de saber si el cliente omitió el campo o lo
-   mandó vacío. Media matriz de casos borde de la v1.3 desaparece por esto (§7).
+   mandó vacío. Media matriz de casos borde de la v1.3 desaparece por esto (§6).
 3. **El tipo hace cumplir parte del contrato.** `legajo` es `int32`: un string numérico o un
    decimal ya no llegan al servidor, los rechaza el stub. Lo que antes era una regla de validación
    ahora es un error de compilación del cliente.
@@ -109,19 +109,7 @@ Devuelve `pong` con el valor recibido, más `servido_por` y `version`.
 
 ---
 
-## 5. `Lenta` — petición lenta
-
-`rpc Lenta(Vacio) returns (RespuestaLenta)`. Duerme **4 segundos** y responde `status: "ok"`.
-
-Sirve para validar dos comportamientos:
-
-1. **Graceful shutdown:** que un RPC en vuelo se complete aunque el proceso reciba `SIGTERM`.
-   En gRPC esto es `server.stop(grace)`, que deja de aceptar RPCs nuevos y espera a los en curso.
-2. **Deploy sin downtime:** mantener tráfico en curso durante el blue-green.
-
----
-
-## 6. `ListarPersonas` — estado compartido
+## 5. `ListarPersonas` — estado compartido
 
 `rpc ListarPersonas(Vacio) returns (ListaPersonas)`
 
@@ -155,7 +143,7 @@ versiona**: va en el `.env` de cada nodo, que está en el `.gitignore`.
 
 ---
 
-## 7. `CrearPersona` — alta
+## 6. `CrearPersona` — alta
 
 `rpc CrearPersona(NuevaPersona) returns (RespuestaPersona)`
 
@@ -223,7 +211,7 @@ argumento más fuerte a favor de este cambio, y va en el informe.
 
 ---
 
-## 8. Qué tiene que cambiar cada equipo
+## 7. Qué tiene que cambiar cada equipo
 
 ### App Java ⬜
 
@@ -231,11 +219,11 @@ argumento más fuerte a favor de este cambio, y va en el informe.
 | :--- | :--- |
 | 1 | Generar los stubs desde `contrato.proto` (`protoc` + `grpc-java`) |
 | 2 | Reemplazar el servidor HTTP por un servidor gRPC |
-| 3 | Los seis RPC de §2 a §7 |
+| 3 | Los seis RPC de §2 a §6 |
 | 4 | `grpc.health.v1.Health` además de `Salud` (§3) |
-| 5 | `/personas` sobre Redis con el esquema de §6 y la validación de §7 |
-| 6 | Bitácora a disco (§9) |
-| 7 | Contenedor (§10) |
+| 5 | `/personas` sobre Redis con el esquema de §5 y la validación de §6 |
+| 6 | Bitácora a disco (§8) |
+| 7 | Contenedor (§9) |
 
 **Es una reescritura, no un ajuste.** El servidor HTTP no se reusa.
 
@@ -245,7 +233,7 @@ argumento más fuerte a favor de este cambio, y va en el informe.
 | :--- | :--- | :--- |
 | 1 | Stubs desde `contrato.proto` | ⬜ |
 | 2 | Servidor gRPC en lugar del HTTP | ⬜ |
-| 3 | Los seis RPC | ⬜ |
+| 3 | Los cinco RPC | ✅ |
 | 4 | `grpc.health.v1.Health` | ⬜ |
 | 5 | Validación y repositorio | ✅ se reusan tal cual: no dependen del transporte |
 | 6 | Bitácora | ⬜ |
@@ -253,7 +241,7 @@ argumento más fuerte a favor de este cambio, y va en el informe.
 
 ---
 
-## 9. Bitácora a disco
+## 8. Bitácora a disco
 
 Cada instancia escribe **una línea por RPC atendido**, en el disco local del nodo donde corre —
 no en la base. Formato idéntico en las dos implementaciones:
@@ -279,7 +267,7 @@ nodo registra qué hizo.
 
 ---
 
-## 10. El servicio corre en contenedores
+## 9. El servicio corre en contenedores
 
 Cada réplica es un contenedor. La base es otro.
 
@@ -291,12 +279,12 @@ Cada réplica es un contenedor. La base es otro.
 | `HEALTHCHECK` | contra `grpc.health.v1.Health`, no con `curl` (no hay HTTP que consultar) |
 | Apagado | el contenedor recibe `SIGTERM`; el proceso tiene que hacer `server.stop(grace)` y no morir de golpe |
 
-El `stop_grace_period` del contenedor tiene que ser **mayor que los 4 s de `Lenta`**, o Docker
+El `stop_grace_period` del contenedor tiene que ser **mayor que el `grace` del servidor**, o Docker
 manda `SIGKILL` en medio del drenado y el graceful shutdown no sirve de nada.
 
 ---
 
-## 11. Requisitos para el equipo Plataforma
+## 10. Requisitos para el equipo Plataforma
 
 ⚠️ **Estos requisitos cambiaron por completo con la v2.0.** No son ajustes: son condiciones sin
 las cuales el balanceador no puede reenviar tráfico.
@@ -322,7 +310,7 @@ las cuales el balanceador no puede reenviar tráfico.
 
 ---
 
-## 12. Registro de versiones
+## 11. Registro de versiones
 
 | Versión | Fecha | Cambios |
 | :--- | :--- | :--- |
@@ -330,22 +318,7 @@ las cuales el balanceador no puede reenviar tráfico.
 | 1.1 | 06/09/2026 | El rate limiting sale del contrato y pasa a extensión. Se agrega el `503` de `/personas`. |
 | 1.2 | 06/09/2026 | `equipo` pasa a lista de objetos con `nombre`, `apellido` y `legajo`. `mensaje` se fija como texto plano. El `checksum` queda fuera del contrato. |
 | 1.3 | 06/09/2026 | `/personas` gana las reglas de validación, el orden en que se aplican y una matriz de casos borde. |
-| **2.0** | **06/09/2026** | **Cambio incompatible: el transporte pasa de HTTP/JSON a gRPC sobre HTTP/2 con Protobuf.** El esquema formal se muda a `contrato.proto`. Los códigos HTTP se reemplazan por códigos de estado gRPC. Trece casos borde desaparecen porque el tipado los hace imposibles. Se agrega `grpc.health.v1.Health`, el despliegue en contenedores (§10) y los requisitos nuevos de Plataforma (§11). |
+| 2.0 | 06/09/2026 | **Cambio incompatible: el transporte pasa de HTTP/JSON a gRPC sobre HTTP/2 con Protobuf.** El esquema formal se muda a `contrato.proto`. Los códigos HTTP se reemplazan por códigos de estado gRPC. Trece casos borde desaparecen porque el tipado los hace imposibles. Se agrega `grpc.health.v1.Health`, el despliegue en contenedores (§9) y los requisitos nuevos de Plataforma (§10). |
+| **2.1** | **06/09/2026** | **Se sacan del contrato el RPC `Lenta` y las dos extensiones de App Python (`checksum` y rate limiting): el grupo decidió no usarlos.** El servicio queda en cinco RPC. El graceful shutdown sigue implementado, pero ya no hay un RPC lento con que evidenciarlo. |
 
 ---
-
-## 13. Fuera del contrato
-
-Extensiones que implementa una sola de las dos apps. **No son obligatorias** y van apagadas: con el
-balanceador repartiendo, una extensión activa hace que el servicio se comporte distinto según quién
-atendió.
-
-| Extensión | De quién | Estado |
-| :--- | :--- | :--- |
-| `checksum` (SHA-256 del fuente) | App Python | Fuera del contrato — decidido. `TP_CHECKSUM` |
-| Rate limiting por cliente | App Python | A definir con el grupo. `TP_RATE_LIMIT` |
-
-En gRPC las dos se implementan como **interceptores**, no como código dentro de cada método. El
-rate limiting, si entra al contrato, necesita las tres condiciones de siempre: que Java lo
-implemente igual, que el contador viva en Redis, y que el cliente se identifique por la metadata
-`x-forwarded-for` (§11.4).

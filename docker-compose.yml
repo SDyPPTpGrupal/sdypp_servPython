@@ -1,12 +1,13 @@
-# Levanta el servicio completo de la App Python: la base compartida y dos réplicas.
+# DESARROLLO LOCAL: la base y dos réplicas en una sola máquina, para poder probar
+# el estado compartido sin depender de nadie.
 #
+#   mkdir -p logs/app-1 logs/app-2
 #   docker compose up --build -d
 #   docker compose ps          # las dos réplicas tienen que quedar (healthy)
 #   docker compose down -v
 #
-# En el despliegue real cada casa levanta sus réplicas y la base corre en un solo
-# nodo: ahí se apunta TP_REDIS_URL al nombre de Tailscale de esa casa y se comenta
-# el servicio redis de este archivo.
+# El DESPLIEGUE REAL es otro: una réplica por máquina y la base en la de Nomico.
+# Para eso está docker-compose.nodo.yml, que es lo que levanta el deploy.sh.
 
 services:
   # La base compartida. En el despliegue hay UNA sola para las dos apps: si cada
@@ -49,8 +50,8 @@ services:
       # Si no existen, los crea Docker como root y el proceso —que corre sin
       # privilegios— no puede escribir adentro.
       - ./logs/app-1:/app/logs
-    # Mayor que los 4 s de Lenta más el grace del servidor: si Docker manda
-    # SIGKILL antes, el graceful shutdown no llega a drenar nada.
+    # Mayor que el grace del servidor: si Docker manda SIGKILL antes, el
+    # graceful shutdown no llega a drenar nada.
     stop_grace_period: 15s
     restart: unless-stopped
 

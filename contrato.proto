@@ -1,5 +1,5 @@
 // Contrato de servicio — App Java <-> App Python
-// Versión 2.0. Ver CONTRATO.md para las reglas que el .proto no puede expresar
+// Versión 2.1. Ver CONTRATO.md para las reglas que el .proto no puede expresar
 // (validación, orden de los chequeos, semántica de los errores).
 //
 // Generar los stubs:
@@ -24,9 +24,6 @@ service Servicio {
 
   // Reemplaza a POST /echo
   rpc Echo(PingPedido) returns (PongRespuesta);
-
-  // Petición deliberadamente lenta (4 s). Reemplaza a GET /slow
-  rpc Lenta(Vacio) returns (RespuestaLenta);
 
   // Reemplaza a GET /personas
   rpc ListarPersonas(Vacio) returns (ListaPersonas);
@@ -69,13 +66,6 @@ message PongRespuesta {
   string pong = 1;
   string servido_por = 2;
   int32 version = 3;
-}
-
-message RespuestaLenta {
-  string status = 1;
-  string mensaje = 2;
-  string app = 3;
-  int32 version = 4;
 }
 
 // El id lo asigna la base, nunca la app. En CrearPersona el cliente no lo manda:

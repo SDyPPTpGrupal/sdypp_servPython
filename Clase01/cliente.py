@@ -1,4 +1,4 @@
-"""Cliente de línea de comandos del contrato v2.0.
+"""Cliente de línea de comandos del contrato v2.1.
 
 Con gRPC ya no alcanza un `curl`: el cliente necesita los stubs. Esto es lo mínimo
 para poder probar una réplica a mano y para la demo.
@@ -6,7 +6,6 @@ para poder probar una réplica a mano y para la demo.
     python3 Clase01/cliente.py localhost:8101 identidad
     python3 Clase01/cliente.py localhost:8101 salud
     python3 Clase01/cliente.py localhost:8101 echo hola
-    python3 Clase01/cliente.py localhost:8101 lenta
     python3 Clase01/cliente.py localhost:8101 personas
     python3 Clase01/cliente.py localhost:8101 alta "Ada Lovelace" 100200
 """
@@ -40,8 +39,6 @@ def main():
                 respuesta = stub.Salud(pb.Vacio(), timeout=5)
             elif operacion == "echo":
                 respuesta = stub.Echo(pb.PingPedido(ping=argumentos[0] if argumentos else ""), timeout=5)
-            elif operacion == "lenta":
-                respuesta = stub.Lenta(pb.Vacio(), timeout=15)
             elif operacion == "personas":
                 respuesta = stub.ListarPersonas(pb.Vacio(), timeout=5)
             elif operacion == "alta":

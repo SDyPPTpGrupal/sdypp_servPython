@@ -18,5 +18,5 @@ grpcio-health-checking==1.83.1
 # reflection: permite que el verificador del equipo cruzado nos pruebe con grpcurl
 # sin tener el .proto ni los stubs (CONTRATO.md §11.6).
 grpcio-reflection==1.83.1
-# redis: la base compartida de personas y el contador del rate limiting.
+# redis: la base compartida de personas.
 redis==8.1.0

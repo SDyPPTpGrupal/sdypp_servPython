@@ -9,8 +9,6 @@ puede expresar: validación, orden de los chequeos y semántica de los errores.
 > Cada punto está decidido. Si algo hay que cambiar, se cambia acá y sube la versión — no se
 > resuelve por chat ni se asume distinto de cada lado.
 
-**Estado:** App Python ✅ al día · App Java ⬜ pendiente (§9)
-
 ---
 
 ## 1. Reglas generales
@@ -197,22 +195,7 @@ Condiciones sin las cuales el balanceador no puede reenviar tráfico.
 
 ---
 
-## 8. Qué le falta a App Java
-
-Es una reescritura, no un ajuste: el servidor HTTP no se reusa.
-
-| # | Cambio |
-| :--- | :--- |
-| 1 | Generar los stubs desde `contrato.proto` (`protoc` + `grpc-java`) |
-| 2 | Servidor gRPC en lugar del HTTP |
-| 3 | Los cinco RPC, con un mensaje de pedido propio por método |
-| 4 | `grpc.health.v1.Health` además de `Salud` |
-| 5 | Personas sobre Redis con el esquema de §4 y la validación de §3 |
-| 6 | Bitácora (§5) y contenedor (§6) |
-
----
-
-## 9. Versiones
+## 8. Versiones
 
 | | Cambios |
 | :--- | :--- |

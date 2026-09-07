@@ -16,23 +16,46 @@ y despliegues que no cortan el servicio.
 
 ## Comandos
 
-Todo el servicio se levanta con Docker. Desde la raíz del repositorio:
+Todo el servicio se levanta con Docker, sin archivos de compose: los mismos comandos que
+usa el `deploy.sh` para levantar una réplica en la casa de cada uno. Desde la raíz del
+repositorio:
 
 ```bash
 # El directorio de la bitácora se crea ANTES: si lo crea Docker queda de root
 # y el proceso, que corre sin privilegios, no puede escribir adentro.
 mkdir -p logs/app-1 logs/app-2
 
-docker compose up --build -d
-docker compose ps          # las dos réplicas y la base tienen que quedar (healthy)
+docker build -t sdypp-app-python:local .
+
+# La red propia es lo que permite que las réplicas alcancen la base por su
+# nombre. Se crea una sola vez.
+docker network create sdypp
+
+# La base compartida. Sin --appendonly los datos no sobreviven a un reinicio.
+docker run -d --name sdypp-redis --network sdypp \
+    redis:8-alpine redis-server --appendonly yes
+
+# Dos réplicas contra la misma base, que es lo que permite probar el estado
+# compartido: el alta la atiende una y la lectura la otra.
+docker run -d --name sdypp-app-1 --network sdypp -p 8101:8080 \
+    -e HOST_NAME=casa-tomas-1 -e CASA=casa-tomas \
+    -e TP_REDIS_URL=redis://sdypp-redis:6379/0 \
+    -v "$PWD/logs/app-1:/app/logs" --stop-timeout 15 sdypp-app-python:local
+
+docker run -d --name sdypp-app-2 --network sdypp -p 8102:8080 \
+    -e HOST_NAME=casa-tomas-2 -e CASA=casa-tomas \
+    -e TP_REDIS_URL=redis://sdypp-redis:6379/0 \
+    -v "$PWD/logs/app-2:/app/logs" --stop-timeout 15 sdypp-app-python:local
+
+docker ps    # las dos réplicas y la base tienen que quedar (healthy)
 ```
 
-Quedan levantados tres contenedores: la base compartida y **dos réplicas** de la app, en los
-puertos `8101` y `8102`. Para bajar todo:
+Quedan tres contenedores: la base y **dos réplicas** en los puertos `8101` y `8102`. Un alta
+hecha contra una se lee desde la otra, que es lo que permite probar el estado compartido sin
+depender de nadie. Para bajar todo:
 
 ```bash
-docker compose down          # conserva los datos de la base
-docker compose down -v       # los borra también
+docker rm -f sdypp-app-1 sdypp-app-2 sdypp-redis
 ```
 
 ### Sin Docker
@@ -341,7 +364,7 @@ elijan"*). ngrok queda para una sola cosa: exponer el balanceador a internet.
 | ✅ | `CrearPersona` / `ListarPersonas` sobre Redis, con validación y alta atómica | Verificado con altas concurrentes desde dos réplicas |
 | ✅ | Graceful shutdown con drenado | Avisa `NOT_SERVING` y espera a los RPC en vuelo |
 | ✅ | Bitácora a disco, un archivo por réplica | |
-| ✅ | Contenedores: compose de desarrollo (base + dos réplicas) y `docker-compose.nodo.yml` para el despliegue real | |
+| ✅ | Contenedores: la app corre en Docker, en desarrollo y en el despliegue | Sin compose: el mismo `docker run` en los dos casos |
 | ⬜ | Los tres aportes propios | Los de la Clase 1 salieron del proyecto |
 | ⬜ | `deploy.sh` blue-green con abort y rollback | Falta definir con Plataforma cómo se pide la conmutación |
 | ⬜ | El verificador, y a qué equipo verificamos | |

@@ -49,7 +49,6 @@ DIR_REMOTO="${DIR_REMOTO:-\$HOME/sdypp}"
 DIR_ENTRANTE="${DIR_ENTRANTE:-/bin/deploy/python}"
 ARTEFACTO="${ARTEFACTO:-$DIR_ENTRANTE/artefacto.tar.gz}"
 
-RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIR_ESTADO="${DIR_ESTADO:-$(dirname "${BASH_SOURCE[0]}")/estado}"
 
 # --- Salida ----------------------------------------------------------------
@@ -188,37 +187,53 @@ version_del_tag() {
 
 ship() {
     local nodo="$1"
-    paso "SHIP — llevar la imagen y el compose a $nodo"
+    paso "SHIP — llevar la imagen a $nodo"
     # Se manda la imagen ya construida, no el código: así las réplicas corren
     # exactamente el mismo binario y ninguna máquina de casa compila nada.
     # Comprimida porque son unos 200 MB por la red de casa.
     docker save "$IMAGEN:$TAG" | gzip -1 \
         | ssh "$nodo" "gunzip | docker load" >/dev/null
+    # Lo único que queda en la casa además de la imagen: los directorios de la
+    # bitácora y el .env, que es del nodo y el deploy nunca toca.
     ssh "$nodo" "mkdir -p $DIR_REMOTO/logs/blue $DIR_REMOTO/logs/green"
-    scp -q "$RAIZ/docker-compose.nodo.yml" "$nodo:$DIR_REMOTO/"
     info "imagen cargada en $nodo"
 }
 
 levantar() {
     local nodo="$1" color="$2" puerto="$3"
     paso "ARRIBA — levantar la $color en $nodo:$puerto"
-    # Proyecto de compose propio por color: los dos contenedores conviven en la
-    # misma máquina sin pisarse el nombre. La que está sirviendo no se toca.
-    ssh "$nodo" "cd $DIR_REMOTO && \
-        COLOR=$color PUERTO=$puerto CASA=$nodo TAG=$TAG \
-        docker compose --env-file .env -f docker-compose.nodo.yml -p sdypp-$color up -d" >/dev/null
+    # docker run y no compose: en la casa hay UN contenedor, sin red compartida ni
+    # dependencias, así que un manifiesto sería una pieza más para mantener igual
+    # en cinco máquinas. Además el nombre lo fija --name y no lo deriva compose,
+    # que lo arma distinto según su versión (sdypp-blue_app_1 en v1, con guiones
+    # en v2): todo el resto del script consulta este nombre exacto.
+    #
+    # El nombre puede quedar ocupado por un deploy anterior que se abortó, así que
+    # se borra antes. Es el color que NO está sirviendo: no hay nada que perder.
+    #
+    # Las -e explícitas pisan lo que venga en el --env-file, que es lo que se
+    # quiere: HOST_NAME lleva el color y el .env sólo aporta TP_REDIS_URL.
+    ssh "$nodo" "docker rm -f sdypp-$color-app-1 >/dev/null 2>&1; \
+        docker run -d \
+            --name sdypp-$color-app-1 \
+            --restart unless-stopped \
+            --stop-timeout 15 \
+            -p $puerto:8080 \
+            --env-file $DIR_REMOTO/.env \
+            -e HOST_NAME=$nodo-$color \
+            -e CASA=$nodo \
+            -v $DIR_REMOTO/logs/$color:/app/logs \
+            $IMAGEN:$TAG" >/dev/null
     info "contenedor sdypp-$color-app-1 arriba"
 }
 
 bajar() {
     local nodo="$1" color="$2"
-    # Las mismas variables que en `levantar`: el compose las interpola también
-    # para bajar, y sin ellas falla con "falta TAG" en vez de borrar nada. Si esto
-    # se traga el error, un deploy abortado deja el contenedor roto dando vueltas.
-    ssh "$nodo" "cd $DIR_REMOTO && \
-        COLOR=$color PUERTO=$(puerto_de "$color") CASA=$nodo TAG=$TAG \
-        docker compose --env-file .env -f docker-compose.nodo.yml -p sdypp-$color down" \
-        >/dev/null || error "no se pudo bajar la $color en $nodo: revisar a mano"
+    # En un aborto se baja el color nuevo en TODOS los nodos, incluidos los que no
+    # llegaron a levantarlo. Ahí `docker rm` falla porque no hay nada que borrar, y
+    # eso no es un problema: se distingue del fallo real en el mensaje.
+    ssh "$nodo" "docker rm -f sdypp-$color-app-1" >/dev/null 2>&1 \
+        || info "$nodo: no había $color que bajar"
 }
 
 verificar_salud() {

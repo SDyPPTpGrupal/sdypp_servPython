@@ -176,7 +176,7 @@ cargar_artefacto() {
     info "$IMAGEN:$TAG"
 }
 
-# La versión sale del tag (vN-commit), no de app.py: el CI/CD no tiene el fuente.
+# La versión sale del tag (vN-commit), no de app/app.py: el CI/CD no tiene el fuente.
 version_del_tag() {
     local v="${TAG#v}"
     v="${v%%-*}"

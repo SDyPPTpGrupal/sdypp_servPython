@@ -42,7 +42,7 @@ error() { printf '\033[31m!!! %s\033[0m\n' "$*" >&2; }
 
 calcular_tag() {
     local version commit sufijo=""
-    version="$(grep -oP '(?<=^VERSION = )\d+' "$RAIZ/Clase01/app.py")"
+    version="$(grep -oP '(?<=^VERSION = )\d+' "$RAIZ/app/app.py")"
     commit="$(git -C "$RAIZ" rev-parse --short HEAD 2>/dev/null || echo local)"
 
     # Si el working tree está sucio, el commit del tag describe algo que no es lo

@@ -38,7 +38,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --from=builder /build/contrato_pb2.py /build/contrato_pb2_grpc.py ./
-COPY Clase01/app.py Clase01/healthcheck.py ./
+COPY app/app.py app/healthcheck.py ./
 
 # Usuario sin privilegios: si alguien se escapa del proceso, no es root del
 # contenedor.

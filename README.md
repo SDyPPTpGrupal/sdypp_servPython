@@ -245,8 +245,6 @@ Ahora lo fija `--name`, y los comandos de desarrollo son los mismos que usa el d
 | ✅ | `publicar.sh` + `deploy.sh` blue-green, paralelo, abort y rollback | Probado end-to-end |
 | ✅ | Diagrama de flujo del deploy | Arriba |
 | ⬜ | La conmutación | Falta la firma del endpoint de Plataforma |
-| ⬜ | Los tres aportes propios | Los de la Clase 1 salieron del proyecto |
-| ⬜ | Las tres mejoras al enunciado | |
 | ⬜ | El verificador, y a qué equipo verificamos | |
 | ⬜ | Diagramas de arquitectura por etapa | |
 

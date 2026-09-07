@@ -6,8 +6,8 @@ CONTRATO.md. Ante una diferencia, manda el contrato.
 
 Se ejecuta desde la raíz del repositorio:
 
-    python3 -m grpc_tools.protoc -I. --python_out=Clase01 --grpc_python_out=Clase01 contrato.proto
-    python3 Clase01/app.py 8080
+    python3 -m grpc_tools.protoc -I. --python_out=app --grpc_python_out=app contrato.proto
+    python3 app/app.py 8080
 """
 
 import os

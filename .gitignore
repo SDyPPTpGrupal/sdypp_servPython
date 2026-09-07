@@ -11,9 +11,9 @@ env/
 
 # Stubs generados desde contrato.proto: son producto del build, no fuente.
 # Se regeneran con el comando del README o con el Dockerfile.
-Clase01/contrato_pb2.py
-Clase01/contrato_pb2.pyi
-Clase01/contrato_pb2_grpc.py
+app/contrato_pb2.py
+app/contrato_pb2.pyi
+app/contrato_pb2_grpc.py
 
 # Bitácora y logs: son del disco local de cada nodo (CONTRATO.md §9).
 logs/

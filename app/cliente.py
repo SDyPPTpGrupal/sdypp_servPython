@@ -3,11 +3,11 @@
 Con gRPC ya no alcanza un `curl`: el cliente necesita los stubs. Esto es lo mínimo
 para poder probar una réplica a mano y para la demo.
 
-    python3 Clase01/cliente.py localhost:8101 identidad
-    python3 Clase01/cliente.py localhost:8101 salud
-    python3 Clase01/cliente.py localhost:8101 echo hola
-    python3 Clase01/cliente.py localhost:8101 personas
-    python3 Clase01/cliente.py localhost:8101 alta "Ada Lovelace" 100200
+    python3 app/cliente.py localhost:8101 identidad
+    python3 app/cliente.py localhost:8101 salud
+    python3 app/cliente.py localhost:8101 echo hola
+    python3 app/cliente.py localhost:8101 personas
+    python3 app/cliente.py localhost:8101 alta "Ada Lovelace" 100200
 """
 
 import os

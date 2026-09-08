@@ -148,31 +148,124 @@ ship a medias deja el contenedor sano corriendo la versión anterior.
 
 ---
 
-## Guía de demo — qué hace cada máquina Python
+## Levantar tu réplica — guía de cero
 
-### Antes (una vez, en cada casa: Tomás y Salvador)
+Para el que pone una casa en el pool. **Todos los comandos se corren parado en la raíz de
+este repo**, salvo los que dicen otra cosa. Son cinco pasos y cada uno termina con su
+comprobación: si la comprobación falla, no sigas al siguiente.
+
+Necesitás dos datos de Tomás, por Discord: **la `TP_REDIS_URL`** (lleva la contraseña de la
+base) y **la clave pública del CI/CD**.
+
+### 1 · Docker y Tailscale
 
 ```bash
-docker --version                        # 1. Docker andando
-sudo systemctl enable --now sshd        # 2. SSH abierto para el CI/CD
-# + la clave pública del CI/CD en ~/.ssh/authorized_keys
-
-mkdir -p ~/sdypp/logs/blue ~/sdypp/logs/green          # 3. directorio del nodo
-printf 'TP_REDIS_URL=redis://:PASS@casa-nomico:6379/0\n' > ~/sdypp/.env
-chmod 600 ~/sdypp/.env
-
-sudo ufw allow in on tailscale0 to any port 8080 proto tcp   # 4. puertos, sólo al tailnet
-sudo ufw allow in on tailscale0 to any port 8081 proto tcp
-sudo ufw allow in on tailscale0 to any port 22   proto tcp
-
-tailscale status                        # 5. conectado con la cuenta del grupo
+docker ps                               # tiene que andar SIN sudo
+tailscale status                        # tu nodo y el de Tomás, en verde
 ```
 
-Tu máquina **no necesita el repo** para servir: sólo recibe la imagen. El repo hace falta
-únicamente en la máquina desde la que se publica.
+Si `docker ps` te pide sudo: `sudo usermod -aG docker "$USER"`, cerrás sesión y volvés a
+entrar. Hace falta porque el deploy corre `docker` por SSH y ahí no hay dónde escribir una
+contraseña.
 
-**Verificación cruzada antes de empezar:** que Salvador corra
-`python3 app/cliente.py casa-tomas:8080 identidad` y le responda. Si eso anda, estás en el pool.
+### 2 · El directorio de la casa
+
+```bash
+mkdir -p ~/sdypp/logs/blue ~/sdypp/logs/green
+
+cat > ~/sdypp/.env <<'EOF'
+TP_REDIS_URL=<la línea que te pasó Tomás, tal cual>
+EOF
+chmod 600 ~/sdypp/.env
+
+cat ~/sdypp/.env                        # que la línea esté completa y sin espacios
+```
+
+⚠️ **`~/sdypp/` no es este repo, y el nombre no es negociable.** Son dos carpetas distintas:
+
+| | Qué es | Dónde |
+| :--- | :--- | :--- |
+| El clon de este repo | El código. Sólo para **construir** la imagen. | Donde lo hayas clonado |
+| `~/sdypp/` | El `.env` con la contraseña y `logs/blue`, `logs/green` | **Exactamente `$HOME/sdypp`** |
+
+`deploy/deploy.sh` tiene esa ruta fija como `DIR_REMOTO` y de ahí saca el `--env-file` y el
+montaje de los logs. Si el `.env` no está ahí, **cada deploy** levanta el contenedor sin
+`TP_REDIS_URL`. Y vive fuera del repo a propósito: lleva la contraseña.
+
+Ojo con el formato, que `--env-file` de Docker es literal: `TP_REDIS_URL=redis://…`, **sin
+espacios alrededor del `=`** y sin comillas. Con un espacio, Docker crea una variable con el
+espacio en el nombre y la app no la ve.
+
+### 3 · El firewall
+
+```bash
+sudo ufw route allow in  on tailscale0
+sudo ufw route allow out on tailscale0
+sudo ufw allow in on tailscale0
+
+nc -vz 100.101.15.93 6379               # tiene que decir succeeded
+```
+
+⚠️ **Son tres reglas y las dos primeras son `route`, no `allow`.** Es lo que más tiempo nos
+costó en toda la entrega:
+
+| Regla | Cadena | Para qué |
+| :--- | :--- | :--- |
+| `route allow in` | `FORWARD` | Que el balanceador **entre** a tu contenedor. Un puerto publicado con `-p` no termina en un proceso del host: se le hace DNAT hacia la IP del contenedor, así que pasa por `FORWARD`, no por `INPUT`. |
+| `route allow out` | `FORWARD` | Que tu contenedor **salga** hacia Redis. Ese tráfico va `docker0 → tailscale0`, que también es `FORWARD`. |
+| `allow in` | `INPUT` | Lo que sí es un proceso del host: `sshd`. |
+
+Con el `DEFAULT_FORWARD_POLICY="DROP"` que trae ufw, un `ufw allow in ... to any port 8080`
+**no sirve para ninguna de las dos cosas**, y el síntoma no apunta al firewall: la app
+responde `UNAVAILABLE` como si la base estuviera caída. Ojo también con que `tailscale ping`
+puede andar igual — lo contesta `tailscaled` sin pasar por el firewall.
+
+### 4 · El SSH para el CI/CD
+
+```bash
+sudo systemctl enable --now sshd
+
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo '<la clave pública que te pasó Tomás>' >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+
+whoami                                  # pasale ESTE nombre a Tomás por Discord
+```
+
+El `whoami` importa: el CI/CD entra con el usuario de tu casa, y si no lo tiene configurado
+el deploy falla con `Permission denied (publickey)` aunque la red esté perfecta.
+
+### 5 · Levantar la réplica
+
+```bash
+docker build -t sdypp-app-python:local .
+
+docker run -d --name sdypp-blue-app-1 --restart unless-stopped \
+    -p 8080:8080 --env-file ~/sdypp/.env \
+    -e HOST_NAME=<tunombre>-blue -e CASA=casa-<tunombre> \
+    -v ~/sdypp/logs/blue:/app/logs --stop-timeout 15 \
+    sdypp-app-python:local
+```
+
+Y las dos comprobaciones que dicen que estás realmente en el pool:
+
+```bash
+docker ps --filter name=sdypp-blue --format '{{.Names}}\t{{.Status}}'   # healthy, no sólo Up
+docker logs sdypp-blue-app-1 | grep personas    # "base compartida en redis://100.101.15.93:6379"
+```
+
+Si la segunda dice *"sin TP_REDIS_URL"*, volvé al paso 2: el `.env` no llegó.
+
+**Avisá por Discord recién cuando las dos den bien.** Tomás no puede levantar el balanceador
+hasta que las réplicas estén.
+
+---
+
+## Guía de demo — qué hace cada máquina Python
+
+**Verificación cruzada antes de empezar:** que otra casa corra
+`python3 app/cliente.py <tu-ip-de-tailscale>:8080 identidad` y le responda. Si eso anda,
+estás en el pool.
 
 ### Durante la demo
 
@@ -196,8 +289,17 @@ docker inspect --format '{{.State.Health.Status}}' sdypp-blue-app-1
 python3 app/cliente.py localhost:8080 salud
 ```
 
-Si los RPC de personas responden `UNAVAILABLE`, es la base: revisar `TP_REDIS_URL` en `~/sdypp/.env`
-y que `casa-nomico` resuelva por Tailscale.
+Si los RPC de personas responden `UNAVAILABLE`, mirá **el arranque antes que la red**:
+
+```bash
+docker logs sdypp-blue-app-1 | grep personas
+```
+
+- *"sin TP_REDIS_URL"* → el `--env-file` no llegó. La app lo decide una sola vez al arrancar
+  y no reintenta nunca, así que **no alcanza con `docker restart`**: el `--env-file` se lee al
+  crear el contenedor. Hay que `docker rm -f` y volver a correr el `docker run`.
+- *"base compartida en…"* → ahí sí es red: `sudo ufw route allow out on tailscale0`, y comprobar
+  con `nc -vz 100.101.15.93 6379`.
 
 ---
 

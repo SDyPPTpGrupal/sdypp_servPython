@@ -1,29 +1,35 @@
 #!/usr/bin/env bash
 #
-# Despliegue blue-green de la App Python, en todos los nodos a la vez.
+# Despliegue blue-green de la App Python, en un comando.
 #
-# Corre dentro del contenedor CI/CD del equipo Plataforma, que llega a las
-# máquinas de cada casa por SSH sobre Tailscale. En el diagrama de la Etapa 2 es
-# /bin/deploy/python/deploy.sh, y lo dispara el watcher cuando publicar.sh deja
-# un artefacto nuevo.
+#   ./deploy.sh desplegar casa-meizers   # build, blue-green y conmutación
+#   ./deploy.sh rollback  casa-meizers   # vuelve al color anterior
+#   ./deploy.sh estado    casa-meizers   # qué corre en cada nodo
 #
-#   ./deploy.sh desplegar casa-tomas casa-salvador   # blue-green, todo o nada
-#   ./deploy.sh rollback  casa-tomas casa-salvador   # vuelve al color anterior
-#   ./deploy.sh estado    casa-tomas casa-salvador   # qué corre en cada nodo
+# CADA CASA DESPLIEGA SU PROPIA RÉPLICA. Se corre en la máquina de la casa, con
+# CASA_LOCAL puesto a su nombre: ahí el script construye la imagen y maneja los
+# contenedores localmente, sin SSH. Es lo que pide el enunciado —"deploy.sh: el
+# pipeline de la Clase 1 en un comando"— y tiene una consecuencia grande de
+# seguridad: si nadie despliega en la máquina de otro, no hace falta que ninguna
+# casa tenga la llave de las demás.
 #
-# La versión nueva se levanta AL LADO de la que sirve, en otro puerto, en TODOS
-# los nodos a la vez. Sólo si todas quedan sanas se le pide al balanceador que
-# cambie de destino. Si una sola falla, no se conmuta ninguna y las viejas siguen
-# sirviendo: nadie llega a ver la versión rota.
+# El modo remoto sigue estando: un nodo que no sea CASA_LOCAL se alcanza por SSH
+# igual que antes. Sirve para desplegar varias casas de una, y es lo que usaba el
+# contenedor CI/CD.
+#
+# La versión nueva se levanta AL LADO de la que sirve, en otro puerto. Sólo si
+# TODAS quedan sanas se le pide al balanceador que cambie de destino. Si una sola
+# falla, no se conmuta ninguna y las viejas siguen sirviendo: nadie llega a ver la
+# versión rota.
 #
 # En paralelo y no de a un nodo por vez porque el deploy secuencial deja un rato
 # con una sola réplica vieja en rotación: si esa se cae justo ahí, no queda nada
 # sirviendo. Conmutando todo junto, en cada instante hay una versión completa.
 #
-# El build NO pasa por acá. La imagen llega ya construida y probada desde
-# publicar.sh; este script sólo la carga y la reparte. Así el CI/CD no necesita
-# el código fuente, ni el .proto, ni saber en qué lenguaje está escrita la app:
-# el mismo script sirve para Java cambiando IMAGEN y la lista de nodos.
+# El precio de que cada casa construya lo suyo: dos casas pueden terminar con
+# imágenes distintas de la misma versión (otro pull de la imagen base, otra
+# caché). Por eso el tag lleva el commit, para poder comparar al menos qué fuente
+# construyó cada una. En modo remoto eso no pasa: se manda la imagen ya armada.
 
 set -euo pipefail
 
@@ -57,8 +63,29 @@ DIR_ESTADO="${DIR_ESTADO:-$(dirname "${BASH_SOURCE[0]}")/estado}"
 # BatchMode evita que se quede pidiendo una passphrase que nadie va a escribir.
 ESPERA_CONEXION="${ESPERA_CONEXION:-8}"
 SSH_OPCIONES=(-o "ConnectTimeout=$ESPERA_CONEXION" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
-ssh()  { command ssh  "${SSH_OPCIONES[@]}" "$@"; }
-scp()  { command scp  "${SSH_OPCIONES[@]}" "$@"; }
+
+# El nombre de ESTA casa. Cuando el nodo a desplegar es ella, los comandos corren
+# acá mismo en vez de salir por SSH: es la máquina propia, no hay red de por
+# medio, y así no hace falta ninguna credencial.
+#
+# Vacío = todo es remoto, que es el comportamiento de antes.
+CASA_LOCAL="${CASA_LOCAL:-}"
+
+es_local() { [[ -n "$CASA_LOCAL" && "$1" == "$CASA_LOCAL" ]]; }
+
+# La raíz del repo, para construir la imagen y leer la versión del contrato.
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Ejecuta un comando en un nodo, sea la casa propia o una ajena. Todas las
+# llamadas del script pasan por acá, así el resto no se entera de la diferencia.
+ssh() {
+    local destino="$1"; shift
+    if es_local "$destino"; then
+        bash -c "$*"
+    else
+        command ssh "${SSH_OPCIONES[@]}" "$destino" "$@"
+    fi
+}
 
 # --- Salida ----------------------------------------------------------------
 
@@ -178,6 +205,21 @@ direccion_de() {
             return
         fi
     done
+
+    # La casa propia sabe su dirección sin que se la digan: es su IP del tailnet.
+    # Sin esto se anunciaría al balanceador con su nombre de casa, que no resuelve
+    # por DNS, y entraría al pool como caída — el síntoma es una réplica que el
+    # balanceador nunca logra chequear aunque esté perfectamente sana.
+    if es_local "$1"; then
+        local propia
+        propia="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+        if [[ -n "$propia" ]]; then
+            echo "$propia"
+            return
+        fi
+        aviso "no pude averiguar la IP de Tailscale de esta casa; se anuncia como '$1'" >&2
+    fi
+
     echo "$1"
 }
 
@@ -194,11 +236,39 @@ lista_backends() {
 
 # --- El artefacto ----------------------------------------------------------
 
+# El tag: versión del contrato + commit. El commit importa porque cada casa
+# construye su propia imagen, así que es lo único que permite comparar después si
+# dos réplicas salieron del mismo fuente.
+calcular_tag() {
+    local version commit sufijo=""
+    version="$(grep -oP '(?<=^VERSION = )\d+' "$RAIZ/app/app.py")"
+    commit="$(git -C "$RAIZ" rev-parse --short HEAD 2>/dev/null || echo local)"
+    # Marcar el working tree sucio evita el peor rato de la demo: un contenedor
+    # que dice v2-abc123 corriendo código que no está en ningún commit.
+    [[ -n "$(git -C "$RAIZ" status --porcelain 2>/dev/null)" ]] && sufijo="-sucio"
+    echo "v${version}-${commit}${sufijo}"
+}
+
+construir() {
+    paso "BUILD — construir la imagen en esta casa"
+    TAG="$(calcular_tag)"
+    [[ "$TAG" == *-sucio ]] && aviso "hay cambios sin commitear: el tag no describe ningún commit"
+    docker build -t "$IMAGEN:$TAG" "$RAIZ" >/dev/null
+    info "$IMAGEN:$TAG ($(docker images --format '{{.Size}}' "$IMAGEN:$TAG"))"
+}
+
 cargar_artefacto() {
     # TAG por variable de entorno: sirve para reintentar un despliegue con una
-    # imagen que ya está cargada, sin volver a leer el .tar.gz.
+    # imagen que ya está cargada, sin volver a construirla ni leer el .tar.gz.
     if [[ -n "${TAG:-}" ]]; then
         info "usando la imagen ya cargada: $IMAGEN:$TAG"
+        return 0
+    fi
+
+    # Con CASA_LOCAL la imagen se construye acá: el fuente está en esta máquina y
+    # no hay artefacto que esperar.
+    if [[ -n "$CASA_LOCAL" ]]; then
+        construir
         return 0
     fi
 
@@ -233,15 +303,21 @@ version_del_tag() {
 
 ship() {
     local nodo="$1"
+    # Los directorios de la bitácora hacen falta siempre. El .env no se toca: es
+    # del nodo, no del release, y lleva la contraseña de la base.
+    ssh "$nodo" "mkdir -p $DIR_REMOTO/logs/blue $DIR_REMOTO/logs/green"
+
+    if es_local "$nodo"; then
+        paso "SHIP — nada que llevar: la imagen se construyó en esta casa"
+        return 0
+    fi
+
     paso "SHIP — llevar la imagen a $nodo"
     # Se manda la imagen ya construida, no el código: así las réplicas corren
     # exactamente el mismo binario y ninguna máquina de casa compila nada.
     # Comprimida porque son unos 200 MB por la red de casa.
     docker save "$IMAGEN:$TAG" | gzip -1 \
         | ssh "$nodo" "gunzip | docker load" >/dev/null
-    # Lo único que queda en la casa además de la imagen: los directorios de la
-    # bitácora y el .env, que es del nodo y el deploy nunca toca.
-    ssh "$nodo" "mkdir -p $DIR_REMOTO/logs/blue $DIR_REMOTO/logs/green"
     info "imagen cargada en $nodo"
 }
 

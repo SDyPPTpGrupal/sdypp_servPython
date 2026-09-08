@@ -51,6 +51,15 @@ ARTEFACTO="${ARTEFACTO:-$DIR_ENTRANTE/artefacto.tar.gz}"
 
 DIR_ESTADO="${DIR_ESTADO:-$(dirname "${BASH_SOURCE[0]}")/estado}"
 
+# SSH con timeout. Sin esto, una casa apagada no da error: deja el deploy colgado
+# esperando un TCP que nunca abre, y el operador no sabe si tarda o si murió.
+# Con ConnectTimeout el nodo caído falla rápido y el todo-o-nada puede abortar.
+# BatchMode evita que se quede pidiendo una passphrase que nadie va a escribir.
+ESPERA_CONEXION="${ESPERA_CONEXION:-8}"
+SSH_OPCIONES=(-o "ConnectTimeout=$ESPERA_CONEXION" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+ssh()  { command ssh  "${SSH_OPCIONES[@]}" "$@"; }
+scp()  { command scp  "${SSH_OPCIONES[@]}" "$@"; }
+
 # --- Salida ----------------------------------------------------------------
 
 paso()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -75,8 +84,22 @@ guardar_estado() {
 COLOR_ACTIVO=$2
 COLOR_ANTERIOR=$3
 VERSION=$4
+VERSION_ANTERIOR=$5
 DESPLEGADO=$(date -Iseconds)
 EOF
+}
+
+# Se guardan las dos versiones, no sólo la que sirve, porque el rollback vuelve a
+# un color que sigue vivo al lado: si no supiéramos qué versión corre ese color,
+# después de volver atrás el estado diría que sirve una versión que ya no sirve.
+version_guardada() {
+    local archivo; archivo="$(archivo_estado "$1")"
+    [[ -f "$archivo" ]] && grep -oP '(?<=^VERSION=).*' "$archivo" || echo ""
+}
+
+version_anterior_guardada() {
+    local archivo; archivo="$(archivo_estado "$1")"
+    [[ -f "$archivo" ]] && grep -oP '(?<=^VERSION_ANTERIOR=).*' "$archivo" || echo ""
 }
 
 # El color es del despliegue, no de cada nodo: si los nodos estuvieran en
@@ -135,13 +158,36 @@ destino_actual() {
     [[ -n "$BALANCEADOR" ]] && curl -fsS "$BALANCEADOR/admin/backends" || true
 }
 
+# A qué dirección llega el balanceador para hablarle a una casa.
+#
+# Nosotros llamamos a los nodos por su nombre (casa-salvador), que es lo que va a
+# la bitácora y a los archivos de estado, pero el balanceador abre un socket y
+# necesita algo que resuelva. CASAS traduce lo uno en lo otro:
+#
+#   CASAS="casa-salvador=salvador@100.91.134.43 casa-mateon=mateo@100.78.246.64"
+#
+# Es la misma variable con la que el CI/CD arma su ~/.ssh/config, así que el
+# usuario y la dirección de cada casa se declaran en un solo lugar. Sin mapa, el
+# nombre del nodo ya se toma como dirección (que es como venía andando).
+direccion_de() {
+    local par
+    for par in ${CASAS:-}; do
+        if [[ "${par%%=*}" == "$1" ]]; then
+            par="${par#*=}"
+            echo "${par##*@}"
+            return
+        fi
+    done
+    echo "$1"
+}
+
 # Arma la lista JSON de backends de un color, para el pedido de conmutación.
 lista_backends() {
     local color="$1"; shift
     local puerto; puerto="$(puerto_de "$color")"
     local nodo salida=""
     for nodo in "$@"; do
-        salida+="${salida:+, }\"$nodo:$puerto\""
+        salida+="${salida:+, }\"$(direccion_de "$nodo"):$puerto\""
     done
     echo "$salida"
 }
@@ -347,7 +393,7 @@ desplegar() {
     fi
 
     for nodo in "${nodos[@]}"; do
-        guardar_estado "$nodo" "$nuevo" "$activo" "$version"
+        guardar_estado "$nodo" "$nuevo" "$activo" "$version" "$(version_guardada "$nodo")"
     done
 
     paso "LISTO"
@@ -387,8 +433,12 @@ rollback() {
     conmutar_a "$(lista_backends "$anterior" "${nodos[@]}")" \
                "$(lista_backends "$activo" "${nodos[@]}")"
 
+    # Las dos versiones se intercambian, igual que los colores: la que serví hasta
+    # recién pasa a ser la anterior y viceversa. Antes acá se guardaba un color en
+    # el campo de la versión, así que el estado quedaba diciendo VERSION=blue.
     for nodo in "${nodos[@]}"; do
-        guardar_estado "$nodo" "$anterior" "$activo" "$(color_activo "$nodo")"
+        guardar_estado "$nodo" "$anterior" "$activo" \
+                       "$(version_anterior_guardada "$nodo")" "$(version_guardada "$nodo")"
     done
     info "el tráfico volvió a las $anterior"
 }

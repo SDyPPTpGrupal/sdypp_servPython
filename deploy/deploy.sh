@@ -2,90 +2,70 @@
 #
 # Despliegue blue-green de la App Python, en un comando.
 #
-#   ./deploy.sh desplegar casa-meizers   # build, blue-green y conmutación
-#   ./deploy.sh rollback  casa-meizers   # vuelve al color anterior
-#   ./deploy.sh estado    casa-meizers   # qué corre en cada nodo
+#   ./deploy/deploy.sh desplegar   # build, blue-green y conmutación
+#   ./deploy/deploy.sh rollback    # vuelve a la versión anterior
+#   ./deploy/deploy.sh estado      # qué corre en esta casa
 #
-# CADA CASA DESPLIEGA SU PROPIA RÉPLICA. Se corre en la máquina de la casa, con
-# CASA_LOCAL puesto a su nombre: ahí el script construye la imagen y maneja los
-# contenedores localmente, sin SSH. Es lo que pide el enunciado —"deploy.sh: el
-# pipeline de la Clase 1 en un comando"— y tiene una consecuencia grande de
-# seguridad: si nadie despliega en la máquina de otro, no hace falta que ninguna
-# casa tenga la llave de las demás.
+# CADA CASA DESPLIEGA SU PROPIA RÉPLICA, en su propia máquina. No hay SSH, no hay
+# servidor de despliegue, no hay artefactos que viajen: el script construye la
+# imagen acá, levanta la versión nueva al lado de la que sirve y le avisa al
+# balanceador.
 #
-# El modo remoto sigue estando: un nodo que no sea CASA_LOCAL se alcanza por SSH
-# igual que antes. Sirve para desplegar varias casas de una, y es lo que usaba el
-# contenedor CI/CD.
+# Que no haya SSH no es una simplificación: es la decisión de seguridad más
+# grande del pipeline. Si nadie despliega en la máquina de otro, ninguna casa
+# necesita tener la llave de las demás, y una credencial filtrada no compromete
+# al grupo entero. Lo único que cada casa expone al tailnet es su réplica.
 #
 # La versión nueva se levanta AL LADO de la que sirve, en otro puerto. Sólo si
-# TODAS quedan sanas se le pide al balanceador que cambie de destino. Si una sola
-# falla, no se conmuta ninguna y las viejas siguen sirviendo: nadie llega a ver la
-# versión rota.
-#
-# En paralelo y no de a un nodo por vez porque el deploy secuencial deja un rato
-# con una sola réplica vieja en rotación: si esa se cae justo ahí, no queda nada
-# sirviendo. Conmutando todo junto, en cada instante hay una versión completa.
+# queda sana se le pide al balanceador que cambie de destino. Si falla, no se
+# conmuta y la vieja sigue sirviendo: nadie llega a ver la versión rota. Y la
+# vieja no se baja al terminar, así volver atrás es un comando y no un deploy en
+# reversa.
 #
 # El precio de que cada casa construya lo suyo: dos casas pueden terminar con
 # imágenes distintas de la misma versión (otro pull de la imagen base, otra
-# caché). Por eso el tag lleva el commit, para poder comparar al menos qué fuente
-# construyó cada una. En modo remoto eso no pasa: se manda la imagen ya armada.
+# caché, otro momento). Por eso el tag lleva el commit, que es lo único que
+# después permite comparar de qué fuente salió cada réplica.
 
 set -euo pipefail
 
-# --- Configuración ---------------------------------------------------------
-# Todo sobreescribible por variable de entorno para no tener que tocar el
-# script en la demo.
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# --- Configuración ---------------------------------------------------------
+# Todo tiene default: el comando corre sin pasarle nada. Lo único que conviene
+# fijar por casa es CASA, que es la etiqueta que sale en la bitácora.
+
+# El nombre de esta casa. Sale en cada línea de la bitácora de la réplica y da
+# nombre al archivo de estado. Si no se pasa, se deriva del hostname: funciona,
+# pero queda feo, así que conviene ponerlo.
+CASA="${CASA:-casa-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+
+# Blue-green por puerto en la misma máquina: la que sirve y la que se está
+# probando conviven, que es lo que hace posible el rollback instantáneo.
 PUERTO_BLUE="${PUERTO_BLUE:-8080}"
 PUERTO_GREEN="${PUERTO_GREEN:-8081}"
 
-# Cuánto se espera a que una versión nueva se declare sana antes de abortar.
-# El HEALTHCHECK de la imagen corre cada 10 s con 5 s de gracia inicial, así que
-# el primer veredicto no llega antes de los ~10 s: 30 intentos de 2 s dan un
-# minuto de margen, suficiente sin colgar la demo si algo salió mal.
+# Cuánto se espera a que la versión nueva se declare sana antes de abortar. El
+# HEALTHCHECK de la imagen corre cada 10 s con 5 s de gracia, así que el primer
+# veredicto no llega antes de los ~10 s: 30 intentos de 2 s dan un minuto de
+# margen, suficiente sin colgar la demo si algo salió mal.
 INTENTOS_SALUD="${INTENTOS_SALUD:-30}"
 ESPERA_SALUD="${ESPERA_SALUD:-2}"
 
-# Directorio del proyecto en la máquina destino. El .env con TP_REDIS_URL vive
-# ahí y el deploy NO lo toca: es del nodo, no del release.
-DIR_REMOTO="${DIR_REMOTO:-\$HOME/sdypp}"
+# El directorio de la casa: el .env con TP_REDIS_URL y las bitácoras. Vive fuera
+# del repo porque lleva la contraseña de la base, y el deploy nunca lo toca: es
+# del nodo, no del release.
+DIR_LOCAL="${DIR_LOCAL:-$HOME/sdypp}"
 
-# Dónde deja publicar.sh el artefacto y dónde lo busca el watcher.
-DIR_ENTRANTE="${DIR_ENTRANTE:-/bin/deploy/python}"
-ARTEFACTO="${ARTEFACTO:-$DIR_ENTRANTE/artefacto.tar.gz}"
+# Dónde se recuerda qué color sirve y con qué versión. Sin esto el rollback no
+# sabe a dónde volver.
+DIR_ESTADO="${DIR_ESTADO:-$RAIZ/deploy/estado}"
 
-DIR_ESTADO="${DIR_ESTADO:-$(dirname "${BASH_SOURCE[0]}")/estado}"
+IMAGEN="${IMAGEN:-sdypp-app-python}"
 
-# SSH con timeout. Sin esto, una casa apagada no da error: deja el deploy colgado
-# esperando un TCP que nunca abre, y el operador no sabe si tarda o si murió.
-# Con ConnectTimeout el nodo caído falla rápido y el todo-o-nada puede abortar.
-# BatchMode evita que se quede pidiendo una passphrase que nadie va a escribir.
-ESPERA_CONEXION="${ESPERA_CONEXION:-8}"
-SSH_OPCIONES=(-o "ConnectTimeout=$ESPERA_CONEXION" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
-
-# El nombre de ESTA casa. Cuando el nodo a desplegar es ella, los comandos corren
-# acá mismo en vez de salir por SSH: es la máquina propia, no hay red de por
-# medio, y así no hace falta ninguna credencial.
-#
-# Vacío = todo es remoto, que es el comportamiento de antes.
-CASA_LOCAL="${CASA_LOCAL:-}"
-
-es_local() { [[ -n "$CASA_LOCAL" && "$1" == "$CASA_LOCAL" ]]; }
-
-# La raíz del repo, para construir la imagen y leer la versión del contrato.
-RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-# Ejecuta un comando en un nodo, sea la casa propia o una ajena. Todas las
-# llamadas del script pasan por acá, así el resto no se entera de la diferencia.
-ssh() {
-    local destino="$1"; shift
-    if es_local "$destino"; then
-        bash -c "$*"
-    else
-        command ssh "${SSH_OPCIONES[@]}" "$destino" "$@"
-    fi
-}
+# El plano de control del balanceador. Es lo único que este script necesita de
+# afuera; si no está, el deploy hace todo menos conmutar y lo dice.
+BALANCEADOR="${BALANCEADOR:-}"
 
 # --- Salida ----------------------------------------------------------------
 
@@ -95,150 +75,80 @@ aviso() { printf '\033[33m    ! %s\033[0m\n' "$*"; }
 error() { printf '\033[31m!!! %s\033[0m\n' "$*" >&2; }
 
 # --- Estado ----------------------------------------------------------------
-# Sin esto el rollback no sabe a dónde volver. Se guarda en el CI/CD, que es
-# quien orquesta: un archivo por nodo.
 
-archivo_estado() { echo "$DIR_ESTADO/$1.env"; }
+archivo_estado() { echo "$DIR_ESTADO/$CASA.env"; }
 
-color_activo() {
-    local archivo; archivo="$(archivo_estado "$1")"
-    [[ -f "$archivo" ]] && grep -oP '(?<=^COLOR_ACTIVO=).*' "$archivo" || echo "blue"
+leer_estado() {
+    local archivo; archivo="$(archivo_estado)"
+    [[ -f "$archivo" ]] && grep -oP "(?<=^$1=).*" "$archivo" || echo "${2:-}"
 }
 
+color_activo()  { leer_estado COLOR_ACTIVO blue; }
+version_activa()   { leer_estado VERSION; }
+version_anterior() { leer_estado VERSION_ANTERIOR; }
+
+# Se guardan las DOS versiones, no sólo la que sirve, porque el rollback vuelve a
+# un color que sigue vivo al lado: si no supiéramos qué versión corre ese color,
+# después de volver atrás el estado diría que sirve una que ya no sirve.
 guardar_estado() {
     mkdir -p "$DIR_ESTADO"
-    cat > "$(archivo_estado "$1")" <<EOF
-COLOR_ACTIVO=$2
-COLOR_ANTERIOR=$3
-VERSION=$4
-VERSION_ANTERIOR=$5
+    cat > "$(archivo_estado)" <<EOF
+COLOR_ACTIVO=$1
+COLOR_ANTERIOR=$2
+VERSION=$3
+VERSION_ANTERIOR=$4
 DESPLEGADO=$(date -Iseconds)
 EOF
 }
 
-# Se guardan las dos versiones, no sólo la que sirve, porque el rollback vuelve a
-# un color que sigue vivo al lado: si no supiéramos qué versión corre ese color,
-# después de volver atrás el estado diría que sirve una versión que ya no sirve.
-version_guardada() {
-    local archivo; archivo="$(archivo_estado "$1")"
-    [[ -f "$archivo" ]] && grep -oP '(?<=^VERSION=).*' "$archivo" || echo ""
-}
-
-version_anterior_guardada() {
-    local archivo; archivo="$(archivo_estado "$1")"
-    [[ -f "$archivo" ]] && grep -oP '(?<=^VERSION_ANTERIOR=).*' "$archivo" || echo ""
-}
-
-# El color es del despliegue, no de cada nodo: si los nodos estuvieran en
-# colores distintos, "conmutar todo junto" no querría decir nada. Que diverjan
-# es señal de que alguien intervino a mano, y ahí frenar es lo correcto.
-color_activo_comun() {
-    local primero="" nodo color
-    for nodo in "$@"; do
-        color="$(color_activo "$nodo")"
-        if [[ -z "$primero" ]]; then
-            primero="$color"
-        elif [[ "$color" != "$primero" ]]; then
-            error "los nodos no están en el mismo color (hay $primero y $color)."
-            error "revisar a mano con: $0 estado $*"
-            return 1
-        fi
-    done
-    echo "$primero"
-}
-
-puerto_de() { [[ "$1" == "blue" ]] && echo "$PUERTO_BLUE" || echo "$PUERTO_GREEN"; }
+puerto_de()  { [[ "$1" == "blue" ]] && echo "$PUERTO_BLUE" || echo "$PUERTO_GREEN"; }
 opuesto_de() { [[ "$1" == "blue" ]] && echo "green" || echo "blue"; }
+contenedor_de() { echo "sdypp-$1-app-1"; }
 
-# --- Lo que depende del balanceador ----------------------------------------
-# En la reunión con Plataforma se acordó que la conmutación es un endpoint HTTP
-# privado del balanceador, con whitelist de la IP del CI/CD. Falta cerrar la
-# forma exacta del pedido; cuando la definan se completan estas dos funciones y
-# no se toca nada más.
-#
-# Ojo que en la Etapa 2 el balanceador ya no tiene UN destino sino una LISTA, así
-# que conmutar es editarla: primero se agregan las nuevas y después se quitan las
-# viejas. En ese orden, porque al revés hay un instante con menos réplicas en
-# rotación.
+# --- El balanceador --------------------------------------------------------
 
-BALANCEADOR="${BALANCEADOR:-}"
-
-conmutar_a() {
-    local nuevos="$1" viejos="$2"
-    if [[ -z "$BALANCEADOR" ]]; then
-        error "No hay BALANCEADOR configurado: no se puede conmutar."
-        info  "Las versiones nuevas quedaron levantadas y sanas, pero el tráfico"
-        info  "sigue yendo a las anteriores. Falta cerrar con Plataforma la forma"
-        info  "del pedido de cambio de destino."
+# La dirección con la que esta casa se anuncia. La sabe sola: es su IP del
+# tailnet. Anunciarse con el nombre de la casa no sirve —no resuelve por DNS— y
+# el síntoma es de los peores: la réplica entra al pool y el balanceador nunca
+# logra chequearla, aunque esté perfectamente sana.
+direccion_propia() {
+    local propia
+    propia="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+    if [[ -z "$propia" ]]; then
+        error "no pude averiguar la IP de Tailscale de esta casa."
+        info  "¿Está corriendo? 'tailscale status'. Si sabés cuál es: DIRECCION=100.x.y.z $0 ..."
         return 1
     fi
-    # TODO(Plataforma): reemplazar por el mecanismo que definan.
+    echo "$propia"
+}
+
+conmutar_a() {
+    local nuevo="$1" viejo="$2"
+    if [[ -z "$BALANCEADOR" ]]; then
+        error "No hay BALANCEADOR configurado: no se puede conmutar."
+        info  "La versión nueva quedó levantada y sana, pero el tráfico sigue"
+        info  "yendo a la anterior. Volvé a correrlo con BALANCEADOR=http://IP:PUERTO"
+        return 1
+    fi
+    # Primero se agrega y después se quita, en ese orden: al revés hay un instante
+    # con menos réplicas en rotación de las que debería haber.
     curl -fsS -X POST "$BALANCEADOR/admin/backends" \
          -H 'Content-Type: application/json' \
-         -d "{\"agregar\": [$nuevos], \"quitar\": [$viejos]}" >/dev/null
+         -d "{\"agregar\": [\"$nuevo\"], \"quitar\": [\"$viejo\"]}" >/dev/null
 }
 
 destino_actual() {
-    # Poder LEER a quién está apuntando el balanceador, no sólo cambiarlo: si el
-    # rollback confía sólo en nuestro archivo de estado, alcanza con que alguien
-    # haya conmutado a mano para que volvamos al backend equivocado.
+    # Poder LEER a quién apunta el balanceador, no sólo cambiarlo: si el rollback
+    # confiara sólo en nuestro archivo de estado, alcanzaría con que alguien haya
+    # conmutado a mano para que volvamos al backend equivocado.
     [[ -n "$BALANCEADOR" ]] && curl -fsS "$BALANCEADOR/admin/backends" || true
 }
 
-# A qué dirección llega el balanceador para hablarle a una casa.
-#
-# Nosotros llamamos a los nodos por su nombre (casa-salvador), que es lo que va a
-# la bitácora y a los archivos de estado, pero el balanceador abre un socket y
-# necesita algo que resuelva. CASAS traduce lo uno en lo otro:
-#
-#   CASAS="casa-salvador=salvador@100.91.134.43 casa-mateon=mateo@100.78.246.64"
-#
-# Es la misma variable con la que el CI/CD arma su ~/.ssh/config, así que el
-# usuario y la dirección de cada casa se declaran en un solo lugar. Sin mapa, el
-# nombre del nodo ya se toma como dirección (que es como venía andando).
-direccion_de() {
-    local par
-    for par in ${CASAS:-}; do
-        if [[ "${par%%=*}" == "$1" ]]; then
-            par="${par#*=}"
-            echo "${par##*@}"
-            return
-        fi
-    done
+# --- La imagen -------------------------------------------------------------
 
-    # La casa propia sabe su dirección sin que se la digan: es su IP del tailnet.
-    # Sin esto se anunciaría al balanceador con su nombre de casa, que no resuelve
-    # por DNS, y entraría al pool como caída — el síntoma es una réplica que el
-    # balanceador nunca logra chequear aunque esté perfectamente sana.
-    if es_local "$1"; then
-        local propia
-        propia="$(tailscale ip -4 2>/dev/null | head -1 || true)"
-        if [[ -n "$propia" ]]; then
-            echo "$propia"
-            return
-        fi
-        aviso "no pude averiguar la IP de Tailscale de esta casa; se anuncia como '$1'" >&2
-    fi
-
-    echo "$1"
-}
-
-# Arma la lista JSON de backends de un color, para el pedido de conmutación.
-lista_backends() {
-    local color="$1"; shift
-    local puerto; puerto="$(puerto_de "$color")"
-    local nodo salida=""
-    for nodo in "$@"; do
-        salida+="${salida:+, }\"$(direccion_de "$nodo"):$puerto\""
-    done
-    echo "$salida"
-}
-
-# --- El artefacto ----------------------------------------------------------
-
-# El tag: versión del contrato + commit. El commit importa porque cada casa
-# construye su propia imagen, así que es lo único que permite comparar después si
-# dos réplicas salieron del mismo fuente.
+# Versión del contrato + commit. El commit importa porque cada casa construye su
+# propia imagen: es lo único que después permite comparar si dos réplicas
+# salieron del mismo fuente.
 calcular_tag() {
     local version commit sufijo=""
     version="$(grep -oP '(?<=^VERSION = )\d+' "$RAIZ/app/app.py")"
@@ -250,304 +160,210 @@ calcular_tag() {
 }
 
 construir() {
-    paso "BUILD — construir la imagen en esta casa"
-    TAG="$(calcular_tag)"
+    paso "BUILD — construir la imagen"
+    TAG="${TAG:-$(calcular_tag)}"
     [[ "$TAG" == *-sucio ]] && aviso "hay cambios sin commitear: el tag no describe ningún commit"
     docker build -t "$IMAGEN:$TAG" "$RAIZ" >/dev/null
     info "$IMAGEN:$TAG ($(docker images --format '{{.Size}}' "$IMAGEN:$TAG"))"
 }
 
-cargar_artefacto() {
-    # TAG por variable de entorno: sirve para reintentar un despliegue con una
-    # imagen que ya está cargada, sin volver a construirla ni leer el .tar.gz.
-    if [[ -n "${TAG:-}" ]]; then
-        info "usando la imagen ya cargada: $IMAGEN:$TAG"
-        return 0
-    fi
-
-    # Con CASA_LOCAL la imagen se construye acá: el fuente está en esta máquina y
-    # no hay artefacto que esperar.
-    if [[ -n "$CASA_LOCAL" ]]; then
-        construir
-        return 0
-    fi
-
-    if [[ ! -f "$ARTEFACTO" ]]; then
-        error "no existe el artefacto $ARTEFACTO"
-        info  "lo deja publicar.sh desde la máquina del desarrollador"
-        return 1
-    fi
-
-    # El nombre y la versión viajan adentro del tar, así que no hay que pasarlos
-    # por separado ni leer el código fuente: por eso el mismo script sirve para
-    # Java sin cambiarle una línea.
-    local cargada
-    cargada="$(docker load -i "$ARTEFACTO" | grep -oP '(?<=Loaded image: ).*' | head -1)"
-    if [[ -z "$cargada" ]]; then
-        error "docker load no devolvió el nombre de la imagen"
-        return 1
-    fi
-    IMAGEN="${cargada%:*}"
-    TAG="${cargada##*:}"
-    info "$IMAGEN:$TAG"
-}
-
-# La versión sale del tag (vN-commit), no de app/app.py: el CI/CD no tiene el fuente.
 version_del_tag() {
-    local v="${TAG#v}"
-    v="${v%%-*}"
+    local v="${TAG#v}"; v="${v%%-*}"
     [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo ""
 }
 
-# --- Pasos sobre un nodo ---------------------------------------------------
-
-ship() {
-    local nodo="$1"
-    # Los directorios de la bitácora hacen falta siempre. El .env no se toca: es
-    # del nodo, no del release, y lleva la contraseña de la base.
-    ssh "$nodo" "mkdir -p $DIR_REMOTO/logs/blue $DIR_REMOTO/logs/green"
-
-    if es_local "$nodo"; then
-        paso "SHIP — nada que llevar: la imagen se construyó en esta casa"
-        return 0
-    fi
-
-    paso "SHIP — llevar la imagen a $nodo"
-    # Se manda la imagen ya construida, no el código: así las réplicas corren
-    # exactamente el mismo binario y ninguna máquina de casa compila nada.
-    # Comprimida porque son unos 200 MB por la red de casa.
-    docker save "$IMAGEN:$TAG" | gzip -1 \
-        | ssh "$nodo" "gunzip | docker load" >/dev/null
-    info "imagen cargada en $nodo"
-}
+# --- Los contenedores ------------------------------------------------------
 
 levantar() {
-    local nodo="$1" color="$2" puerto="$3"
-    paso "ARRIBA — levantar la $color en $nodo:$puerto"
-    # docker run y no compose: en la casa hay UN contenedor, sin red compartida ni
+    local color="$1" puerto="$2" contenedor; contenedor="$(contenedor_de "$color")"
+    paso "ARRIBA — levantar la $color en :$puerto"
+
+    # docker run y no compose: acá hay UN contenedor, sin red compartida ni
     # dependencias, así que un manifiesto sería una pieza más para mantener igual
-    # en cinco máquinas. Además el nombre lo fija --name y no lo deriva compose,
-    # que lo arma distinto según su versión (sdypp-blue_app_1 en v1, con guiones
-    # en v2): todo el resto del script consulta este nombre exacto.
+    # en cada casa. Además el nombre lo fija --name y no lo deriva compose, que lo
+    # arma distinto según su versión: todo el resto del script consulta este
+    # nombre exacto.
     #
-    # El nombre puede quedar ocupado por un deploy anterior que se abortó, así que
+    # El nombre puede estar ocupado por un deploy anterior que se abortó, así que
     # se borra antes. Es el color que NO está sirviendo: no hay nada que perder.
-    #
+    docker rm -f "$contenedor" >/dev/null 2>&1 || true
+
+    mkdir -p "$DIR_LOCAL/logs/blue" "$DIR_LOCAL/logs/green"
+
     # Las -e explícitas pisan lo que venga en el --env-file, que es lo que se
     # quiere: HOST_NAME lleva el color y el .env sólo aporta TP_REDIS_URL.
-    ssh "$nodo" "docker rm -f sdypp-$color-app-1 >/dev/null 2>&1; \
-        docker run -d \
-            --name sdypp-$color-app-1 \
-            --restart unless-stopped \
-            --stop-timeout 15 \
-            -p $puerto:8080 \
-            --env-file $DIR_REMOTO/.env \
-            -e HOST_NAME=$nodo-$color \
-            -e CASA=$nodo \
-            -v $DIR_REMOTO/logs/$color:/app/logs \
-            $IMAGEN:$TAG" >/dev/null
-    info "contenedor sdypp-$color-app-1 arriba"
+    #
+    # --stop-timeout 15 tiene que ser mayor que el grace del servidor, o llega el
+    # SIGKILL en medio del drenado de las peticiones en vuelo.
+    # El `if` explícito no es adorno: esta función se llama desde una condición
+    # (`if ! levantar ...`), y ahí bash desactiva `set -e`. Sin esto, un docker
+    # run que falla no aborta nada: la función sigue, informa "arriba" y el deploy
+    # se va a VERIFY a esperar un minuto por un contenedor que no existe.
+    if ! docker run -d \
+        --name "$contenedor" \
+        --restart unless-stopped \
+        --stop-timeout 15 \
+        -p "$puerto:8080" \
+        --env-file "$DIR_LOCAL/.env" \
+        -e "HOST_NAME=$CASA-$color" \
+        -e "CASA=$CASA" \
+        -v "$DIR_LOCAL/logs/$color:/app/logs" \
+        "$IMAGEN:$TAG" >/dev/null
+    then
+        error "no se pudo levantar $contenedor en :$puerto"
+        info  "si dice 'address already in use', ese puerto ya lo usa otra cosa"
+        info  "en esta máquina: cambialo con PUERTO_BLUE / PUERTO_GREEN"
+        return 1
+    fi
+
+    info "contenedor $contenedor arriba"
 }
 
 bajar() {
-    local nodo="$1" color="$2"
-    # En un aborto se baja el color nuevo en TODOS los nodos, incluidos los que no
-    # llegaron a levantarlo. Ahí `docker rm` falla porque no hay nada que borrar, y
-    # eso no es un problema: se distingue del fallo real en el mensaje.
-    ssh "$nodo" "docker rm -f sdypp-$color-app-1" >/dev/null 2>&1 \
-        || info "$nodo: no había $color que bajar"
+    local contenedor; contenedor="$(contenedor_de "$1")"
+    docker rm -f "$contenedor" >/dev/null 2>&1 \
+        || info "no había $1 que bajar"
+}
+
+salud_de() {
+    # tail -1 porque si el contenedor no existe, inspect deja una línea vacía
+    # antes de fallar y el estado saldría con un salto de línea adentro.
+    local estado
+    estado="$(docker inspect --format '{{.State.Health.Status}}' "$(contenedor_de "$1")" 2>/dev/null | tail -1)"
+    echo "${estado:-sin-contenedor}"
 }
 
 verificar_salud() {
-    local nodo="$1" color="$2" version_esperada="$3"
-    paso "VERIFY — ¿la $color de $nodo está sana y es la versión nueva?"
+    local color="$1" version_esperada="$2" contenedor; contenedor="$(contenedor_de "$color")"
+    paso "VERIFY — ¿la $color está sana y es la versión nueva?"
 
-    # No hace falta un cliente gRPC en el CI/CD: el HEALTHCHECK de la imagen ya
-    # consulta grpc.health.v1.Health desde adentro del contenedor, y Docker
-    # guarda el veredicto. Acá sólo se lo pregunta.
-    local estado
+    # No hace falta un cliente gRPC: el HEALTHCHECK de la imagen ya consulta
+    # grpc.health.v1.Health desde adentro del contenedor y Docker guarda el
+    # veredicto. Acá sólo se lo pregunta.
+    local estado i
     for ((i = 1; i <= INTENTOS_SALUD; i++)); do
-        estado="$(ssh "$nodo" \
-            "docker inspect --format '{{.State.Health.Status}}' sdypp-$color-app-1 2>/dev/null" \
-            || echo "sin-contenedor")"
+        estado="$(salud_de "$color")"
         case "$estado" in
-            healthy) info "sana tras $((i * ESPERA_SALUD))s"; break ;;
-            unhealthy) error "$nodo: el contenedor se declaró unhealthy"; return 1 ;;
+            healthy)   info "sana tras $((i * ESPERA_SALUD))s"; break ;;
+            unhealthy) error "el contenedor se declaró unhealthy"; return 1 ;;
         esac
-        [[ $i -eq $INTENTOS_SALUD ]] && { error "$nodo: no se puso sana en $((INTENTOS_SALUD * ESPERA_SALUD))s (último estado: $estado)"; return 1; }
+        if [[ $i -eq $INTENTOS_SALUD ]]; then
+            error "no se puso sana en $((INTENTOS_SALUD * ESPERA_SALUD))s (último estado: $estado)"
+            return 1
+        fi
         sleep "$ESPERA_SALUD"
     done
 
-    # Un 'healthy' no alcanza: si el ship falló a medias, el contenedor puede
-    # estar sano corriendo la versión ANTERIOR y daríamos por bueno un deploy
-    # que nunca subió.
+    # Un 'healthy' no alcanza: si el build no rehizo lo que creíamos, el
+    # contenedor puede estar sano corriendo la versión ANTERIOR y daríamos por
+    # bueno un deploy que nunca cambió nada.
     if [[ -z "$version_esperada" ]]; then
         aviso "el tag $TAG no tiene versión numérica: sólo se verificó la salud"
         return 0
     fi
     local version_real
-    version_real="$(ssh "$nodo" "docker logs sdypp-$color-app-1 2>&1 | grep -oP '(?<=version=)\\d+' | head -1")"
+    version_real="$(docker logs "$contenedor" 2>&1 | grep -oP '(?<=version=)\d+' | head -1)"
     if [[ "$version_real" != "$version_esperada" ]]; then
-        error "$nodo: la $color responde version=$version_real y se esperaba $version_esperada"
+        error "la $color responde version=$version_real y se esperaba $version_esperada"
         return 1
     fi
     info "version=$version_real, la que se acaba de desplegar"
 }
 
-# Todo lo que se le hace a un nodo antes de conmutar. Corre en background, uno
-# por nodo, con la salida a su propio archivo para que los logs no se entrelacen.
-preparar() {
-    local nodo="$1" color="$2" puerto="$3" version="$4"
-    ship "$nodo"
-    levantar "$nodo" "$color" "$puerto"
-    verificar_salud "$nodo" "$color" "$version"
-}
-
 # --- Comandos --------------------------------------------------------------
 
 desplegar() {
-    local -a nodos=("$@")
-    local activo nuevo puerto_nuevo version
+    local activo nuevo puerto_nuevo version direccion
 
-    paso "CARGAR — leer el artefacto publicado"
-    cargar_artefacto
-
-    activo="$(color_activo_comun "${nodos[@]}")"
+    activo="$(color_activo)"
     nuevo="$(opuesto_de "$activo")"
     puerto_nuevo="$(puerto_de "$nuevo")"
+    direccion="${DIRECCION:-$(direccion_propia)}"
+
+    if [[ ! -f "$DIR_LOCAL/.env" ]]; then
+        error "no existe $DIR_LOCAL/.env"
+        info  "es donde vive TP_REDIS_URL. Sin eso la réplica arranca sin base y"
+        info  "los RPC de personas responden UNAVAILABLE para siempre."
+        return 1
+    fi
+
+    construir
     version="$(version_del_tag)"
 
     echo
-    echo "Nodos: ${nodos[*]}"
+    echo "Casa: $CASA ($direccion)"
     echo "Sirviendo $activo · se despliega $nuevo en :$puerto_nuevo · $IMAGEN:$TAG"
 
-    # --- Fase 1: preparar todos los nodos a la vez ---
-    paso "PREPARAR — los ${#nodos[@]} nodos en paralelo"
-    local tmp; tmp="$(mktemp -d)"
-    local -A pid_de=()
-    local nodo
-    for nodo in "${nodos[@]}"; do
-        preparar "$nodo" "$nuevo" "$puerto_nuevo" "$version" > "$tmp/$nodo.log" 2>&1 &
-        pid_de[$nodo]=$!
-        info "$nodo lanzado (pid ${pid_de[$nodo]})"
-    done
-
-    local -a fallidos=()
-    for nodo in "${nodos[@]}"; do
-        wait "${pid_de[$nodo]}" || fallidos+=("$nodo")
-    done
-
-    # Los logs de cada nodo, ya ordenados: en paralelo se habrían mezclado.
-    for nodo in "${nodos[@]}"; do
-        printf '\n\033[1m──────── %s ────────\033[0m\n' "$nodo"
-        cat "$tmp/$nodo.log"
-    done
-    rm -rf "$tmp"
-
-    # --- Fase 2: conmutar, o abortar ---
-    if [[ ${#fallidos[@]} -gt 0 ]]; then
-        paso "ABORTA — fallaron: ${fallidos[*]}"
-        # Se bajan TODAS las nuevas, no sólo las que fallaron: si quedara alguna
-        # arriba, el próximo deploy la encontraría ocupando el puerto del color
-        # que le toca usar.
-        for nodo in "${nodos[@]}"; do
-            bajar "$nodo" "$nuevo"
-        done
-        error "Deploy abortado. Sigue sirviendo la $activo en todos los nodos."
+    if ! levantar "$nuevo" "$puerto_nuevo" || ! verificar_salud "$nuevo" "$version"; then
+        paso "ABORTA"
+        bajar "$nuevo"
+        error "Deploy abortado. Sigue sirviendo la $activo en :$(puerto_de "$activo")."
         error "Nadie vio la versión rota."
         return 1
     fi
 
-    paso "CONMUTAR — mandar el tráfico a las $nuevo"
-    local nuevos viejos
-    nuevos="$(lista_backends "$nuevo" "${nodos[@]}")"
-    viejos="$(lista_backends "$activo" "${nodos[@]}")"
-    info "agregar: $nuevos"
-    info "quitar:  $viejos"
-    if ! conmutar_a "$nuevos" "$viejos"; then
-        return 1
-    fi
+    paso "CONMUTAR — mandar el tráfico a la $nuevo"
+    info "agregar: $direccion:$puerto_nuevo"
+    info "quitar:  $direccion:$(puerto_de "$activo")"
+    conmutar_a "$direccion:$puerto_nuevo" "$direccion:$(puerto_de "$activo")" || return 1
 
-    for nodo in "${nodos[@]}"; do
-        guardar_estado "$nodo" "$nuevo" "$activo" "$version" "$(version_guardada "$nodo")"
-    done
+    guardar_estado "$nuevo" "$activo" "$version" "$(version_activa)"
 
     paso "LISTO"
-    info "Sirviendo las $nuevo (version $version) en :$puerto_nuevo"
-    info "Las $activo siguen vivas en :$(puerto_de "$activo") — el rollback es un comando"
+    info "Sirviendo la $nuevo (version $version) en :$puerto_nuevo"
+    info "La $activo sigue viva en :$(puerto_de "$activo") — el rollback es un comando"
 }
 
 rollback() {
-    local -a nodos=("$@")
-    local activo anterior puerto_anterior
+    local activo anterior puerto_anterior direccion estado
 
-    activo="$(color_activo_comun "${nodos[@]}")"
+    activo="$(color_activo)"
     anterior="$(opuesto_de "$activo")"
     puerto_anterior="$(puerto_de "$anterior")"
+    direccion="${DIRECCION:-$(direccion_propia)}"
 
-    paso "ROLLBACK — volver a las $anterior en :$puerto_anterior"
+    paso "ROLLBACK — volver a la $anterior en :$puerto_anterior"
 
-    # Las anteriores siguen corriendo, así que esto es sólo cambiar el destino:
-    # no hay que reconstruir, ni copiar, ni levantar nada. Pero se verifica que
-    # estén sanas en TODOS los nodos antes de mandarles tráfico.
-    local nodo estado
-    local -a sin_respaldo=()
-    for nodo in "${nodos[@]}"; do
-        estado="$(ssh "$nodo" "docker inspect --format '{{.State.Health.Status}}' sdypp-$anterior-app-1 2>/dev/null" || echo "sin-contenedor")"
-        if [[ "$estado" != "healthy" ]]; then
-            sin_respaldo+=("$nodo ($estado)")
-        else
-            info "$nodo: la $anterior está sana"
-        fi
-    done
-
-    if [[ ${#sin_respaldo[@]} -gt 0 ]]; then
-        error "no hay a dónde volver en: ${sin_respaldo[*]}"
+    # La anterior sigue corriendo, así que esto es sólo cambiar el destino: no hay
+    # que reconstruir, ni copiar, ni levantar nada. Pero se verifica que esté sana
+    # antes de mandarle tráfico.
+    estado="$(salud_de "$anterior")"
+    if [[ "$estado" != "healthy" ]]; then
+        error "no hay a dónde volver: la $anterior está '$estado'"
         return 1
     fi
+    info "la $anterior está sana"
 
-    conmutar_a "$(lista_backends "$anterior" "${nodos[@]}")" \
-               "$(lista_backends "$activo" "${nodos[@]}")"
+    conmutar_a "$direccion:$puerto_anterior" "$direccion:$(puerto_de "$activo")" || return 1
 
-    # Las dos versiones se intercambian, igual que los colores: la que serví hasta
-    # recién pasa a ser la anterior y viceversa. Antes acá se guardaba un color en
-    # el campo de la versión, así que el estado quedaba diciendo VERSION=blue.
-    for nodo in "${nodos[@]}"; do
-        guardar_estado "$nodo" "$anterior" "$activo" \
-                       "$(version_anterior_guardada "$nodo")" "$(version_guardada "$nodo")"
-    done
-    info "el tráfico volvió a las $anterior"
+    # Las dos versiones se intercambian, igual que los colores: la que servía
+    # pasa a ser la anterior y viceversa.
+    guardar_estado "$anterior" "$activo" "$(version_anterior)" "$(version_activa)"
+    info "el tráfico volvió a la $anterior"
 }
 
 estado() {
-    echo "destino del balanceador: $(destino_actual || echo '(no configurado)')"
-    local nodo
-    for nodo in "$@"; do
-        echo
-        echo "── $nodo ──"
-        echo "   color activo según el CI/CD: $(color_activo "$nodo")"
-        ssh "$nodo" "docker ps --filter name=sdypp- --format '   {{.Names}}\t{{.Status}}\t{{.Ports}}'" 2>/dev/null \
-            || echo "   (no se pudo consultar el nodo)"
-    done
+    echo "casa:           $CASA"
+    echo "color activo:   $(color_activo)  (version $(version_activa))"
+    echo "color anterior: $(opuesto_de "$(color_activo)")  (version $(version_anterior))"
+    echo
+    echo "contenedores:"
+    docker ps --filter name=sdypp- --format '   {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    echo
+    echo "backends del balanceador:"
+    destino_actual | sed 's/^/   /' || echo "   (no configurado)"
 }
 
 # --- Punto de entrada ------------------------------------------------------
 
-comando="${1:-}"
-shift || true
-
-if [[ -z "$comando" || $# -eq 0 ]]; then
-    # Corta en la primera linea que no es comentario: asi la ayuda es la cabecera
-    # completa y nada mas, aunque la cabecera cambie de largo.
-    awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"
-    exit 2
-fi
-
-IMAGEN="${IMAGEN:-sdypp-app-python}"
-
-case "$comando" in
-    desplegar) desplegar "$@" ;;
-    rollback)  rollback  "$@" ;;
-    estado)    estado    "$@" ;;
-    *) error "comando desconocido: $comando"; exit 2 ;;
+case "${1:-}" in
+    desplegar) desplegar ;;
+    rollback)  rollback ;;
+    estado)    estado ;;
+    *)
+        # Corta en la primera línea que no es comentario: así la ayuda es la
+        # cabecera completa y nada más, aunque la cabecera cambie de largo.
+        awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"
+        exit 2
+        ;;
 esac

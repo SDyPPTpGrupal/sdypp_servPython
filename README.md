@@ -71,91 +71,78 @@ Sin Docker: `pip install -r requirements.txt -r requirements-build.txt`, generar
 
 ## El deploy
 
-Dos scripts, en dos máquinas distintas. La frontera entre ellos es un archivo `.tar.gz`.
+**Un script, en la máquina de cada casa.** Cada casa despliega su propia réplica: no hay servidor
+de despliegue, no hay SSH y no hay artefactos que viajen por la red.
+
+```bash
+./deploy/deploy.sh desplegar   # build, blue-green y conmutación
+./deploy/deploy.sh rollback    # vuelve a la versión anterior
+./deploy/deploy.sh estado      # qué corre en esta casa
+```
 
 ```mermaid
 flowchart TD
-    START(["Cambio en local"]) --> BUILD
-    BUILD["publicar.sh - BUILD<br/>compila el .proto y construye la imagen"] --> PROBAR
-    PROBAR{"publicar.sh - PROBAR<br/>la imagen arranca y se declara sana?"}
-    PROBAR -->|"no"| NOSUBE["NO PUBLICA<br/>el error queda en tu terminal"]
-    PROBAR -->|"si"| SUBIR["publicar.sh - SUBIR<br/>scp a entrante.tmp y renombrar"]
+    START(["Cambio en el codigo"]) --> BUILD
+    BUILD["BUILD<br/>compila el .proto y construye la imagen<br/>tag = version + commit"] --> ARRIBA
+    ARRIBA["ARRIBA<br/>levanta la VERDE al lado de la AZUL<br/>en el otro puerto"] --> VERIFY
 
-    SUBIR --> WATCH["el watcher del CI/CD lo detecta<br/>y dispara deploy.sh"]
-    WATCH --> SHIP["deploy.sh - SHIP<br/>la imagen a las N casas, en paralelo"]
-    SHIP --> ARRIBA["deploy.sh - ARRIBA<br/>la VERDE al lado de la AZUL, otro puerto<br/>en TODAS las casas a la vez"]
-    ARRIBA --> VERIFY
+    VERIFY{"VERIFY<br/>sana Y con la version nueva?"}
+    VERIFY -->|"no"| ABORT["ABORTA<br/>baja la verde, no conmuta<br/>la azul nunca dejo de servir"]
+    VERIFY -->|"si"| CONMUTAR
 
-    VERIFY{"deploy.sh - VERIFY<br/>TODAS sanas y con la version nueva?"}
-    VERIFY -->|"una sola falla"| ABORT["ABORTA<br/>se bajan TODAS las verdes<br/>no se conmuta ninguna<br/>las azules nunca dejaron de servir"]
-    VERIFY -->|"todas si"| CONMUTAR
+    CONMUTAR["CONMUTAR<br/>le avisa al balanceador:<br/>agrega la verde, quita la azul"] --> OK(["Sirviendo la version nueva<br/>la AZUL queda viva al lado"])
+    OK -.->|"si algo sale mal despues"| ROLLBACK["ROLLBACK<br/>vuelve a apuntar a la azul<br/>que sigue corriendo"]
 
-    CONMUTAR["CONMUTAR<br/>agregar las verdes al balanceador<br/>y quitar las azules"] --> OK(["Sirviendo la version nueva<br/>las AZULES quedan vivas"])
-    OK -.->|"si algo sale mal despues"| ROLLBACK["ROLLBACK<br/>volver a apuntar a las azules<br/>que siguen corriendo al lado"]
-
-    style PROBAR fill:#f96,stroke:#333,stroke-width:3px,color:#111
     style VERIFY fill:#f96,stroke:#333,stroke-width:3px,color:#111
     style ABORT fill:#f66,stroke:#333,stroke-width:2px,color:#111
-    style NOSUBE fill:#f66,stroke:#333,stroke-width:2px,color:#111
     style ROLLBACK fill:#f66,stroke:#333,stroke-width:2px,color:#111
 ```
 
-**Dos puntos de aborto, no uno.** `publicar.sh` prueba la imagen en tu máquina y no sube si no
-arranca; `deploy.sh` verifica en la casa, con Redis y red reales, y no conmuta si algo falla. Un
-error de sintaxis lo agarra el primero; un problema de conectividad, sólo el segundo.
+**Por qué cada casa despliega la suya.** No es una simplificación: es la decisión de seguridad más
+grande del pipeline. Si nadie despliega en la máquina de otro, **ninguna casa necesita tener la
+llave de las demás**, y una credencial filtrada no compromete al grupo entero. Lo único que cada
+casa expone al tailnet es su réplica.
 
 **La versión vieja no se baja al terminar.** Queda corriendo al lado para que volver atrás sea un
 comando y no un deploy en reversa; se baja recién cuando entra una tercera versión.
 
-### `deploy/publicar.sh` — lo corrés vos
+**El `verify` no se conforma con un `healthy`:** compara la versión contra la que se acaba de
+construir. Un build que no rehizo lo que creíamos deja el contenedor sano corriendo la versión
+anterior, y sin este chequeo daríamos por bueno un deploy que no cambió nada.
 
-```bash
-./deploy/publicar.sh --local   # construir, probar y empaquetar
-./deploy/publicar.sh           # + subir al CI/CD
-```
+**La casa se anuncia con su IP del tailnet**, que averigua sola con `tailscale ip -4`. Anunciarse
+con el nombre de la casa no sirve —no resuelve por DNS— y el síntoma es de los peores: la réplica
+entra al pool y el balanceador nunca logra chequearla, aunque esté perfectamente sana.
 
-Construye la imagen, **la levanta para verificar que arranca y se declara sana**, la empaqueta
-(223 MB → 53 MB) y la sube a un nombre temporal que después renombra: el `mv` es atómico, así el
-watcher del CI/CD nunca ve un tar a medio copiar. Si la imagen no queda sana, no sube nada.
+**Lo que se paga:** como cada casa construye su propia imagen, dos casas pueden terminar con
+imágenes distintas de la misma versión (otro pull de la imagen base, otra caché, otro momento). Por
+eso el tag lleva el commit: es lo único que después permite comparar de qué fuente salió cada
+réplica. Con un servidor de despliegue que reparte una imagen ya armada eso no pasaría — es el
+intercambio que elegimos, no un descuido.
 
-El tag lleva versión y commit (`v2-a1b2c3d`), con sufijo `-sucio` si hay cambios sin commitear.
+### Variables
 
-### `deploy/deploy.sh` — corre en el CI/CD
+Todo tiene default; el comando corre sin pasarle nada.
 
-```bash
-./deploy.sh desplegar casa-tomas casa-salvador   # blue-green, todo o nada
-./deploy.sh rollback  casa-tomas casa-salvador   # vuelve al color anterior
-./deploy.sh estado    casa-tomas casa-salvador
-```
-
-**No buildea**: la imagen le llega hecha, y el nombre y la versión viajan dentro del artefacto.
-Por eso el CI/CD no necesita el código fuente, ni el `.proto`, ni saber en qué lenguaje está
-escrita la app — el mismo script sirve para Java cambiando `IMAGEN` y la lista de nodos.
-
-Levanta la versión nueva **al lado** de la que sirve, en el otro puerto (blue 8080 / green 8081),
-en **todos los nodos a la vez**, y sólo conmuta si todas quedaron sanas. Si una falla, se bajan
-todas y el balanceador nunca se entera: nadie ve la versión rota.
-
-En paralelo y no de a un nodo por vez porque el deploy secuencial deja un rato con una sola
-réplica vieja en rotación: si esa se cae justo ahí, no queda nada sirviendo.
-
-El `verify` no se conforma con un `healthy`: **compara la versión** contra la que se desplegó. Un
-ship a medias deja el contenedor sano corriendo la versión anterior.
-
-> ⬜ **Pendiente de Plataforma:** cómo se le pide al balanceador que cambie de destino. En la
-> reunión se acordó que es un endpoint HTTP privado con whitelist de la IP del CI/CD, pero falta
-> la forma exacta del pedido. Está aislado en `conmutar_a` y `destino_actual`.
+| Variable | Para qué | Default |
+| :--- | :--- | :--- |
+| `CASA` | Etiqueta de esta casa: sale en la bitácora y nombra el archivo de estado | derivada del hostname |
+| `BALANCEADOR` | Plano de control. Sin esto hace todo menos conmutar, y lo dice | vacío |
+| `PUERTO_BLUE` / `PUERTO_GREEN` | Los dos puertos del blue-green | `8080` / `8081` |
+| `DIR_LOCAL` | El `.env` y las bitácoras de la casa | `~/sdypp` |
+| `DIRECCION` | Con qué dirección se anuncia, si `tailscale ip` no sirve | la del tailnet |
 
 ---
 
 ## Levantar tu réplica — guía de cero
 
 Para el que pone una casa en el pool. **Todos los comandos se corren parado en la raíz de
-este repo**, salvo los que dicen otra cosa. Son cinco pasos y cada uno termina con su
-comprobación: si la comprobación falla, no sigas al siguiente.
+este repo.** Son cuatro pasos y cada uno termina con su comprobación: si la comprobación
+falla, no sigas al siguiente.
 
-Necesitás dos datos de Tomás, por Discord: **la `TP_REDIS_URL`** (lleva la contraseña de la
-base) y **la clave pública del CI/CD**.
+Necesitás un solo dato de Tomás, por Discord: **la `TP_REDIS_URL`**, que lleva la contraseña
+de la base. Nada más — no hay claves que intercambiar, porque nadie despliega en la máquina
+de nadie.
 
 ### 1 · Docker y Tailscale
 
@@ -165,8 +152,8 @@ tailscale status                        # tu nodo y el de Tomás, en verde
 ```
 
 Si `docker ps` te pide sudo: `sudo usermod -aG docker "$USER"`, cerrás sesión y volvés a
-entrar. Hace falta porque el deploy corre `docker` por SSH y ahí no hay dónde escribir una
-contraseña.
+entrar. El `deploy.sh` corre `docker` sin `sudo`, así que si te lo pide, el deploy se cuelga
+esperando una contraseña que nadie escribe.
 
 ### 2 · El directorio de la casa
 
@@ -185,12 +172,12 @@ cat ~/sdypp/.env                        # que la línea esté completa y sin esp
 
 | | Qué es | Dónde |
 | :--- | :--- | :--- |
-| El clon de este repo | El código. Sólo para **construir** la imagen. | Donde lo hayas clonado |
+| El clon de este repo | El código y el `deploy.sh`. Es desde donde desplegás. | Donde lo hayas clonado |
 | `~/sdypp/` | El `.env` con la contraseña y `logs/blue`, `logs/green` | **Exactamente `$HOME/sdypp`** |
 
-`deploy/deploy.sh` tiene esa ruta fija como `DIR_REMOTO` y de ahí saca el `--env-file` y el
-montaje de los logs. Si el `.env` no está ahí, **cada deploy** levanta el contenedor sin
-`TP_REDIS_URL`. Y vive fuera del repo a propósito: lleva la contraseña.
+`deploy/deploy.sh` toma esa ruta de `DIR_LOCAL` y de ahí saca el `--env-file` y el montaje de
+los logs. Si el `.env` no está ahí, **cada deploy** levanta el contenedor sin `TP_REDIS_URL`. Y
+vive fuera del repo a propósito: lleva la contraseña.
 
 Ojo con el formato, que `--env-file` de Docker es literal: `TP_REDIS_URL=redis://…`, **sin
 espacios alrededor del `=`** y sin comillas. Con un espacio, Docker crea una variable con el
@@ -201,60 +188,47 @@ espacio en el nombre y la app no la ve.
 ```bash
 sudo ufw route allow in  on tailscale0
 sudo ufw route allow out on tailscale0
-sudo ufw allow in on tailscale0
 
-nc -vz 100.101.15.93 6379               # tiene que decir succeeded
+nc -vz <la IP de la casa que corre Redis> 6379    # tiene que decir succeeded
 ```
 
-⚠️ **Son tres reglas y las dos primeras son `route`, no `allow`.** Es lo que más tiempo nos
+⚠️ **Son de `route`, no de `allow`.** Es lo que más tiempo nos
 costó en toda la entrega:
 
 | Regla | Cadena | Para qué |
 | :--- | :--- | :--- |
 | `route allow in` | `FORWARD` | Que el balanceador **entre** a tu contenedor. Un puerto publicado con `-p` no termina en un proceso del host: se le hace DNAT hacia la IP del contenedor, así que pasa por `FORWARD`, no por `INPUT`. |
 | `route allow out` | `FORWARD` | Que tu contenedor **salga** hacia Redis. Ese tráfico va `docker0 → tailscale0`, que también es `FORWARD`. |
-| `allow in` | `INPUT` | Lo que sí es un proceso del host: `sshd`. |
+
+Las dos son de `FORWARD`, y no hace falta ninguna de `INPUT`: **tu máquina no expone ningún
+proceso propio.** Lo único que se alcanza desde afuera es el contenedor de la réplica.
 
 Con el `DEFAULT_FORWARD_POLICY="DROP"` que trae ufw, un `ufw allow in ... to any port 8080`
 **no sirve para ninguna de las dos cosas**, y el síntoma no apunta al firewall: la app
 responde `UNAVAILABLE` como si la base estuviera caída. Ojo también con que `tailscale ping`
 puede andar igual — lo contesta `tailscaled` sin pasar por el firewall.
 
-### 4 · El SSH para el CI/CD
+### 4 · Levantar la réplica
+
+Un comando. Construye la imagen, la levanta, espera a que se declare sana, verifica que sea la
+versión que acabás de construir y recién ahí le avisa al balanceador.
 
 ```bash
-sudo systemctl enable --now sshd
-
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-echo '<la clave pública que te pasó Tomás>' >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-
-whoami                                  # pasale ESTE nombre a Tomás por Discord
-```
-
-El `whoami` importa: el CI/CD entra con el usuario de tu casa, y si no lo tiene configurado
-el deploy falla con `Permission denied (publickey)` aunque la red esté perfecta.
-
-### 5 · Levantar la réplica
-
-```bash
-docker build -t sdypp-app-python:local .
-
-docker run -d --name sdypp-blue-app-1 --restart unless-stopped \
-    -p 8080:8080 --env-file ~/sdypp/.env \
-    -e HOST_NAME=<tunombre>-blue -e CASA=casa-<tunombre> \
-    -v ~/sdypp/logs/blue:/app/logs --stop-timeout 15 \
-    sdypp-app-python:local
+CASA=casa-<tunombre> BALANCEADOR=http://100.101.15.93:8081 ./deploy/deploy.sh desplegar
 ```
 
 Y las dos comprobaciones que dicen que estás realmente en el pool:
 
 ```bash
-docker ps --filter name=sdypp-blue --format '{{.Names}}\t{{.Status}}'   # healthy, no sólo Up
-docker logs sdypp-blue-app-1 | grep personas    # "base compartida en redis://100.101.15.93:6379"
+./deploy/deploy.sh estado
+docker logs sdypp-green-app-1 | grep personas   # "base compartida en redis://..."
 ```
 
-Si la segunda dice *"sin TP_REDIS_URL"*, volvé al paso 2: el `.env` no llegó.
+Si la segunda dice *"sin TP_REDIS_URL"*, volvé al paso 2: el `.env` no llegó. Ojo que la app
+lo decide una sola vez al arrancar y no reintenta, así que hay que volver a desplegar.
+
+De ahí en más, cada versión nueva es el mismo comando: cambiás `VERSION` en `app/app.py` y
+volvés a correr `desplegar`. Alterna solo entre azul y verde.
 
 **Avisá por Discord recién cuando las dos den bien.** Tomás no puede levantar el balanceador
 hasta que las réplicas estén.
@@ -344,9 +318,9 @@ Ahora lo fija `--name`, y los comandos de desarrollo son los mismos que usa el d
 | ✅ | Personas sobre Redis con alta atómica | Verificado con altas concurrentes |
 | ✅ | Graceful shutdown con drenado | `NOT_SERVING` y espera a los RPC en vuelo |
 | ✅ | Bitácora a disco, un archivo por réplica | |
-| ✅ | `publicar.sh` + `deploy.sh` blue-green, paralelo, abort y rollback | Probado end-to-end |
+| ✅ | `deploy.sh`: build, blue-green, abort y rollback, sin SSH | Probado end-to-end contra el balanceador |
+| ✅ | La conmutación | `POST /admin/backends` del balanceador |
 | ✅ | Diagrama de flujo del deploy | Arriba |
-| ⬜ | La conmutación | Falta la firma del endpoint de Plataforma |
 | ⬜ | Los tres aportes propios | Los de la Clase 1 salieron del proyecto |
 | ⬜ | Las tres mejoras al enunciado | |
 | ⬜ | El verificador, y a qué equipo verificamos | |

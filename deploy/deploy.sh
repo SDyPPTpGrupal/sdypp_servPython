@@ -34,6 +34,21 @@ RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # --- Configuración ---------------------------------------------------------
 # Todo tiene default: el comando corre sin pasarle nada. Lo único que conviene
 # fijar por casa es CASA, que es la etiqueta que sale en la bitácora.
+#
+# Cada casa lo configura UNA vez en deploy/deploy.env (no se versiona: copiar de
+# deploy.env.example). Sin esto habría que repetir las mismas variables en cada
+# deploy, y olvidarse de BALANCEADOR sale caro: el script hace todo —construye,
+# levanta la versión nueva, la verifica— y recién falla al conmutar, dejándola
+# arriba pero sin tráfico.
+#
+# El archivo usa la forma `: "${VAR:=valor}"`, que asigna sólo si la variable no
+# viene ya del entorno. Así un valor puntual se pisa sin editar el archivo:
+#
+#     BALANCEADOR=http://otra:8081 ./deploy/deploy.sh desplegar
+if [[ -f "$RAIZ/deploy/deploy.env" ]]; then
+    # shellcheck disable=SC1091
+    source "$RAIZ/deploy/deploy.env"
+fi
 
 # El nombre de esta casa. Sale en cada línea de la bitácora de la réplica y da
 # nombre al archivo de estado. Si no se pasa, se deriva del hostname: funciona,

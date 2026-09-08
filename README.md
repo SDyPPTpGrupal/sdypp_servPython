@@ -80,23 +80,60 @@ de despliegue, no hay SSH y no hay artefactos que viajen por la red.
 ./deploy/deploy.sh estado      # qué corre en esta casa
 ```
 
+### El blue-green, adentro de una casa
+
+Las dos versiones conviven en la misma máquina, en dos puertos. Desplegar es levantar
+la que no está sirviendo; conmutar es mover una flecha.
+
+```mermaid
+flowchart LR
+    BA["Balanceador<br/>manda el tráfico a UNO de los dos"]
+
+    subgraph CASA["La casa · las dos versiones corren a la vez"]
+        direction TB
+        BLUE["blue · :8080<br/>v1 · la que venía sirviendo"]
+        GREEN["green · :8081<br/>v2 · la recién desplegada"]
+    end
+
+    BA -.->|"antes del deploy — y a donde vuelve el rollback"| BLUE
+    BA ==>|"después de conmutar"| GREEN
+```
+
+### Qué hace `deploy.sh desplegar`
+
 ```mermaid
 flowchart TD
-    START(["Cambio en el codigo"]) --> BUILD
-    BUILD["BUILD<br/>compila el .proto y construye la imagen<br/>tag = version + commit"] --> ARRIBA
-    ARRIBA["ARRIBA<br/>levanta la VERDE al lado de la AZUL<br/>en el otro puerto"] --> VERIFY
+    START(["./deploy/deploy.sh desplegar"]) --> EST["Lee deploy/estado/casa-X.env<br/>¿qué color está sirviendo hoy?"]
 
-    VERIFY{"VERIFY<br/>sana Y con la version nueva?"}
-    VERIFY -->|"no"| ABORT["ABORTA<br/>baja la verde, no conmuta<br/>la azul nunca dejo de servir"]
-    VERIFY -->|"si"| CONMUTAR
+    EST --> BUILD["BUILD<br/>docker build acá mismo<br/>tag = versión + commit corto<br/>sufijo -sucio si hay cambios sin commitear"]
+    BUILD --> ARRIBA["ARRIBA<br/>docker run del color que NO sirve, en su puerto<br/>--env-file ~/sdypp/.env · logs montados<br/>--stop-timeout 15 para que drene lo que está en vuelo"]
+    ARRIBA --> VERIFY{"VERIFY<br/>¿healthy Y corriendo la versión nueva?<br/>hasta 30 intentos de 2 s"}
 
-    CONMUTAR["CONMUTAR<br/>le avisa al balanceador:<br/>agrega la verde, quita la azul"] --> OK(["Sirviendo la version nueva<br/>la AZUL queda viva al lado"])
-    OK -.->|"si algo sale mal despues"| ROLLBACK["ROLLBACK<br/>vuelve a apuntar a la azul<br/>que sigue corriendo"]
+    VERIFY -->|"no"| ABORT["ABORTA<br/>docker rm -f del color nuevo<br/>y NO toca el balanceador"]
+    ABORT --> SIGUE(["Sigue sirviendo la vieja<br/>nadie llegó a ver la versión rota"])
 
-    style VERIFY fill:#f96,stroke:#333,stroke-width:3px,color:#111
-    style ABORT fill:#f66,stroke:#333,stroke-width:2px,color:#111
-    style ROLLBACK fill:#f66,stroke:#333,stroke-width:2px,color:#111
+    VERIFY -->|"sí"| CONMUTAR["CONMUTAR<br/>POST /admin/backends con la IP del tailnet<br/>primero agrega la nueva, después quita la vieja"]
+    CONMUTAR --> GUARDA["Anota el estado<br/>color activo y anterior, versión y anterior"]
+    GUARDA --> OK(["Sirviendo la nueva<br/>la anterior queda VIVA al lado"])
+
+    OK -.->|"./deploy/deploy.sh rollback"| RB{"¿La anterior<br/>sigue sana?"}
+    RB -->|"sí"| VUELVE["Conmuta al revés<br/>no reconstruye nada: es cambiar un destino"]
+    RB -->|"no"| NADA["No hay a dónde volver, y lo dice"]
+    VUELVE --> OK2(["Sirviendo la anterior"])
+
+    classDef corta fill:#f8e3e0,stroke:#b5342a,stroke-width:2px,color:#141d2b
+    classDef sano fill:#dcefe7,stroke:#12805a,stroke-width:2px,color:#141d2b
+    classDef duda fill:#f6ebd7,stroke:#9c6408,stroke-width:2px,color:#141d2b
+    class ABORT,NADA corta
+    class SIGUE,OK,OK2 sano
+    class VERIFY,RB duda
 ```
+
+El orden importa en dos lugares. **La conmutación es el último paso**: mientras no se llamó al
+balanceador, el tráfico nunca dejó de ir a la versión que servía, y por eso abortar sale gratis.
+Y dentro de la conmutación, **primero se agrega y después se quita**: al revés hay un instante con
+menos réplicas en rotación de las que debería haber.
+
 
 **Por qué cada casa despliega la suya.** No es una simplificación: es la decisión de seguridad más
 grande del pipeline. Si nadie despliega en la máquina de otro, **ninguna casa necesita tener la

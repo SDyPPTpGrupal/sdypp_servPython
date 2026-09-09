@@ -346,6 +346,118 @@ Ahora lo fija `--name`, y los comandos de desarrollo son los mismos que usa el d
 
 ---
 
+## Aportes propios
+
+Tres cosas que el enunciado no pedía y que decidimos poner igual.
+
+### 1 · gRPC + Protobuf en lugar de HTTP/JSON, con reflection
+
+El enunciado fija el contrato en HTTP (`GET /`, `GET /health`, `POST /echo`, `GET|POST /personas`).
+Lo reescribimos como cinco RPC sobre un `.proto` compartido con la App Java, y además exponemos
+el health estándar `grpc.health.v1.Health` y **server reflection**.
+
+**Por qué.** El contrato deja de ser un README que cada implementación interpreta y pasa a ser un
+artefacto que compila: el mismo `.proto` genera los stubs de los dos lados, así que una diferencia
+de campos se ve al generar y no en la demo. La reflection es lo que hace posible la regla de que
+*la verificación no la hace el dueño*: el equipo cruzado nos prueba con `grpcurl` sin que le
+pasemos los stubs. De paso, es el Hit #8 del TP1 adelantado.
+
+**Lo que se paga:** gRPC no viaja sobre HTTP/1.1, así que el balanceador ya no puede ser un proxy
+HTTP de cien líneas — las condiciones que le impone están en [CONTRATO.md §7](CONTRATO.md).
+
+### 2 · Graceful shutdown en dos fases, coordinado con el balanceador y con Docker
+
+El enunciado sólo lo *pregunta* («¿cómo se apaga un proceso con dignidad?»). Está implementado, y
+el orden de los tres pasos es lo que importa:
+
+| Paso | Qué hace | Por qué en ese orden |
+| :--- | :--- | :--- |
+| `SIGTERM` → `NOT_SERVING` | `enter_graceful_shutdown()` marca la réplica como no-sana | El balanceador la saca de rotación **antes** de que empiece a drenar; al revés le sigue mandando RPC nuevos mientras se apaga |
+| `stop(grace=10)` | Deja de aceptar RPC nuevos y espera a los que están en vuelo | Es lo que evita cortar una request a mitad de camino justo durante el deploy |
+| `--stop-timeout 15` | El plazo que Docker le da al contenedor | Tiene que ser **mayor** que el `grace`, o llega el `SIGKILL` en medio del drenado y todo lo anterior no sirvió de nada |
+
+**Por qué.** Son tres timeouts en tres capas distintas —app, balanceador y runtime— y basta con que
+uno esté mal ordenado para perder requests en cada deploy. El blue-green del enunciado supone que
+bajar la versión vieja es gratis; sin esto, no lo es.
+
+### 3 · Alta atómica en Redis con un script Lua
+
+El enunciado sólo dice que «el `id` lo asigna la base». Metimos las cinco operaciones del alta
+—chequear el legajo, `INCR`, `HSET`, `ZADD` y `SET`— en un único script Lua, que Redis corre sin
+intercalar comandos de otros clientes.
+
+**Por qué.** Con `INCR` solo alcanza para que los `id` no se pisen, pero no para la unicidad de
+legajo: entre «consulto si existe» y «lo escribo» se cuela otra réplica y quedan dos personas con
+el mismo legajo. El script cierra esa ventana y resuelve la pregunta 6 del enunciado **sin
+exclusión mutua entre casas**, que es un problema bastante más grande.
+
+**Verificado** con 25 altas simultáneas del mismo legajo (1 alta y 24 `ALREADY_EXISTS`) y 40
+concurrentes desde dos réplicas (ids 1 a 40, sin huecos).
+
+---
+
+## Mejoras al enunciado
+
+### 1 · La base compartida no tiene dueño ni contrato de esquema
+
+El enunciado dice «levantan un contenedor con una base mínima (la que elijan)… dónde corre y quién
+lo opera: lo negocian y lo cuentan». Es el **único componente que no aparece en la tabla de
+equipos**, y a la vez el único que dos implementaciones distintas escriben a la vez.
+
+**El problema.** El enunciado especifica el contrato de la *API* (el JSON de `/personas`) pero no el
+del *almacenamiento*. Si Java guarda `person:7` y Python `persona:7`, las dos apps cumplen el
+contrato al 100% y aun así no encuentran lo del otro — que es justo lo que la demo de la Etapa 2
+tiene que mostrar. Lo tuvimos que definir nosotros en [CONTRATO.md §4](CONTRATO.md).
+
+**La mejora.** Pedir el esquema de claves o tablas como entregable explícito, y asignarle dueño a
+la base en la tabla de equipos.
+
+### 2 · El plano de control app↔balanceador no está especificado, y bloquea toda la Etapa 1
+
+El enunciado le pide a los equipos de app un `deploy.sh` con blue-green, abort y rollback, cuyo
+último paso es «el conmutador cambia»: una llamada al balanceador, que lo escribe **otro equipo**.
+No hay contrato para eso — ni cómo se agrega un backend, ni cómo se quita, ni cómo se lista el pool.
+
+**El problema.** El entregable de un equipo depende de una API que el enunciado no menciona y que
+otro equipo todavía no diseñó. Terminamos usando `POST /admin/backends`, decidido sobre la marcha;
+sin eso, `deploy.sh desplegar` construye, levanta el color nuevo, verifica… y no puede conmutar.
+
+**La mejora.** Fijar ese contrato mínimo —agregar, quitar y listar backend— como pieza previa a las
+etapas, con el mismo nivel de detalle con que el enunciado fija el contrato de datos.
+
+### 3 · El formato de bitácora no permite la auditoría que el propio enunciado exige
+
+El enunciado fija cinco campos y después pide «eligen un alta concreta y la rastrean por los
+archivos: el log del balanceador dice a quién la derivó, el log de esa casa dice qué hizo».
+
+**El problema.** Con esos cinco campos no se puede. La precisión del formato es de **segundos**, así
+que dos altas del mismo segundo son indistinguibles; y los relojes de las casas no están
+sincronizados, cosa que el propio picante 8 admite. Falta un **id de correlación** que genere el
+balanceador y propague a la réplica. Nosotros lo pedimos en [CONTRATO.md §7](CONTRATO.md) como
+metadata `x-request-id`, pero el formato de log **no tiene dónde escribirlo**, así que el cruce
+sigue siendo por inspección manual.
+
+**La mejora.** Un sexto campo obligatorio de correlación en el formato. Es una línea de contrato que
+convierte la auditoría de «mirar dos archivos y creerse» en un `grep` del mismo id en las dos casas.
+
+### De reserva
+
+**La red entre casas debería ser una Etapa 0 con validación, no un «lo resuelven ustedes».** Fue lo
+que más tiempo costó de toda la entrega: las reglas de ufw van en `route` (cadena `FORWARD`) y no en
+`allow` (`INPUT`), porque un puerto publicado con `-p` no termina en un proceso del host sino en un
+DNAT hacia el contenedor. Y el síntoma no apunta al firewall —la app responde `UNAVAILABLE` como si
+la base estuviera caída— mientras `tailscale ping` anda igual, porque lo contesta `tailscaled` sin
+pasar por el firewall. El TP3 Parte 0 ya hace exactamente esto con k3s: una checklist verificable
+antes de repartir el trabajo.
+
+**El verificador cruzado no tiene criterio de aprobación.** «Dispara N requests, cuenta códigos y
+muestra el resultado» no dice qué N, con qué concurrencia, qué se considera aprobado (¿cero
+errores?, ¿qué desvío de reparto se tolera?) ni qué protocolo asume del lado del que verifica. *La
+demo se mide, no se mira* queda a mitad de camino: se mide, pero nadie fijó cuál es el número que
+pasa.
+
+---
+
 ## Estado
 
 | | Punto | |
@@ -358,8 +470,8 @@ Ahora lo fija `--name`, y los comandos de desarrollo son los mismos que usa el d
 | ✅ | `deploy.sh`: build, blue-green, abort y rollback, sin SSH | Probado end-to-end contra el balanceador |
 | ✅ | La conmutación | `POST /admin/backends` del balanceador |
 | ✅ | Diagrama de flujo del deploy | Arriba |
-| ⬜ | Los tres aportes propios | Los de la Clase 1 salieron del proyecto |
-| ⬜ | Las tres mejoras al enunciado | |
+| ✅ | Los tres aportes propios | Arriba |
+| ✅ | Las tres mejoras al enunciado | Arriba, con dos de reserva |
 | ⬜ | El verificador, y a qué equipo verificamos | |
 | ⬜ | Diagramas de arquitectura por etapa | |
 

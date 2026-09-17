@@ -221,15 +221,32 @@ ARCHIVO_BITACORA = os.path.join(DIRECTORIO_LOGS, f"bitacora-{HOST}.log")
 _LOCK_BITACORA = threading.Lock()
 
 
-def bitacora(rpc: str, codigo: str, identificador=None):
+def id_del_pedido(context):
+    """El x-request-id que manda el balanceador, si vino.
+
+    Es la misma cadena en cada intento de un pedido: cuando una réplica muere y
+    el balanceador reasigna, el mismo id aparece en la bitácora de la casa que
+    no contestó y en la de la que atendió. Sin balanceador (grpcurl, el cliente
+    de prueba) no viene, y no se escribe nada.
+    """
+    for clave, valor in context.invocation_metadata():
+        if clave == "x-request-id":
+            return valor
+    return None
+
+
+def bitacora(rpc: str, codigo: str, identificador=None, pedido=None):
     """Registra una operación atendida.
 
     El formato es contrato: es lo que permite cruzar este archivo con el log del
     balanceador y auditar una operación puntual. Él registra a quién derivó, el
-    nodo registra qué hizo.
+    nodo registra qué hizo. `pedido` es el x-request-id: se suma al quinto
+    campo, después del id, así los cinco campos siguen siendo cinco.
     """
-    linea = f"{_ahora_iso()} | {APP_NAME}@{CASA} | {rpc} | {codigo} | " \
-            f"{'id=' + str(identificador) if identificador is not None else '-'}"
+    quinto = "id=" + str(identificador) if identificador is not None else "-"
+    if pedido:
+        quinto += f" req={pedido}"
+    linea = f"{_ahora_iso()} | {APP_NAME}@{CASA} | {rpc} | {codigo} | {quinto}"
     try:
         with _LOCK_BITACORA:
             os.makedirs(DIRECTORIO_LOGS, exist_ok=True)
@@ -245,7 +262,7 @@ class Servicio(pb_grpc.ServicioServicer):
     """Los cinco RPC del contrato."""
 
     def Identidad(self, request, context):
-        bitacora("Identidad", "OK")
+        bitacora("Identidad", "OK", pedido=id_del_pedido(context))
         return pb.Instancia(
             app=APP_NAME,
             lenguaje=LENGUAJE,
@@ -257,7 +274,7 @@ class Servicio(pb_grpc.ServicioServicer):
         )
 
     def Salud(self, request, context):
-        bitacora("Salud", "OK")
+        bitacora("Salud", "OK", pedido=id_del_pedido(context))
         return pb.EstadoSalud(status=pb.EstadoSalud.SANO, app=APP_NAME, version=VERSION)
 
     def Echo(self, request, context):
@@ -266,7 +283,7 @@ class Servicio(pb_grpc.ServicioServicer):
         if not request.ping:
             return self._fallar(context, grpc.StatusCode.INVALID_ARGUMENT,
                                 "se requiere el campo ping", "Echo")
-        bitacora("Echo", "OK")
+        bitacora("Echo", "OK", pedido=id_del_pedido(context))
         return pb.PongRespuesta(pong=request.ping, servido_por=APP_NAME, version=VERSION)
 
     def ListarPersonas(self, request, context):
@@ -277,7 +294,7 @@ class Servicio(pb_grpc.ServicioServicer):
         except BaseNoDisponible as e:
             return self._sin_base(context, "ListarPersonas", e)
 
-        bitacora("ListarPersonas", "OK")
+        bitacora("ListarPersonas", "OK", pedido=id_del_pedido(context))
         return pb.ListaPersonas(
             servido_por=APP_NAME,
             personas=[pb.Persona(**persona) for persona in personas],
@@ -299,7 +316,7 @@ class Servicio(pb_grpc.ServicioServicer):
             return self._fallar(context, grpc.StatusCode.ALREADY_EXISTS,
                                 "el legajo ya está registrado", "CrearPersona")
 
-        bitacora("CrearPersona", "OK", identificador)
+        bitacora("CrearPersona", "OK", identificador, pedido=id_del_pedido(context))
         return pb.RespuestaPersona(
             servido_por=APP_NAME,
             persona=pb.Persona(id=identificador, nombre=nombre, legajo=request.legajo),
@@ -307,7 +324,7 @@ class Servicio(pb_grpc.ServicioServicer):
 
     def _fallar(self, context, codigo, mensaje, rpc):
         """Registra el fallo y aborta el RPC con el código del contrato."""
-        bitacora(rpc, codigo.name)
+        bitacora(rpc, codigo.name, pedido=id_del_pedido(context))
         context.abort(codigo, mensaje)
 
     def _sin_base(self, context, rpc, motivo):

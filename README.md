@@ -86,26 +86,31 @@ sube al registry del grupo y le deja un manifiesto al CD. El deploy en las casas
 ```mermaid
 flowchart LR
     DEV["Dev · su máquina<br/>clon del repo + Docker + clave id_deploy"]
-    REG[("Registry · Datos<br/>100.78.246.64:5000")]
+    REG[("Registry · Datos<br/>100.91.228.65:5000")]
 
     subgraph PLAT["Plataforma · 100.101.15.93"]
-        CD["CD · sdypp-cd<br/>sshd :2222 + vigilante"]
+        CD["CD · sdypp-cd<br/>sshd :2222 · objetivo :8082"]
         BA["Balanceador<br/>:8081 loopback"]
     end
 
-    subgraph CASAS["Cada casa · Docker + sshd + ~/sdypp/"]
+    subgraph CASAS["Cada casa · Docker + sdypp-agente + ~/sdypp/"]
+        AG["agente"]
         BLUE["blue"]
         GREEN["green"]
     end
 
     DEV -->|"1 · docker push"| REG
     DEV -->|"2 · manifiesto.json por ssh"| CD
-    CD -->|"3 · ssh: docker pull por digest, docker run"| GREEN
-    REG -.->|"pull"| GREEN
-    CD -->|"4 · grpcurl Identidad: ¿version == manifiesto?"| GREEN
-    CD -->|"5 · POST /admin/backends<br/>agrega green, quita blue"| BA
+    AG -->|"3 · GET /objetivo (long-poll, saliente)"| CD
+    REG -.->|"4 · docker pull por digest"| AG
+    AG -->|"5 · docker run del color nuevo"| GREEN
+    AG -->|"6 · POST /reporte listo vN"| CD
+    CD -->|"7 · grpcurl Identidad: ¿version == manifiesto?"| GREEN
+    CD -->|"8 · POST /admin/backends<br/>agrega green, quita blue"| BA
     BA -.->|"gRPC"| GREEN
 ```
+
+Ninguna flecha entra a una casa: el agente es el que llama, siempre.
 
 `publicar.sh` termina en el paso 2. No espera el deploy: del `manifiesto.json` en adelante es
 todo del CD, y se sigue con `docker logs -f sdypp-cd` en Plataforma.
@@ -132,12 +137,22 @@ Variables, todas con default: `REGISTRY`, `IMAGEN`, `CD_SSH` (alias `cd` de `~/.
 
 ### Qué hace el CD con el manifiesto
 
-En todas las casas **a la vez**, por SSH: `docker pull` por digest → `docker run` del color que
-no está sirviendo → espera `healthy` **y** verifica `Identidad.version` desde afuera. Si **una**
-casa no pasa, baja las nuevas en todas y no toca el balanceador: nadie vio la versión rota.
-Si pasan todas, **un solo POST** a `/admin/backends` con todas las casas (primero agrega,
-después quita) y guarda el estado. La versión vieja no se baja: queda al lado para el rollback,
-que es el mismo POST al revés. Los detalles y los comandos exactos están en el repo del CD.
+El CD no ejecuta nada en las casas. Publica un **objetivo** —qué imagen va en blue y cuál en
+green, casa por casa, con un número de generación que sólo sube— y espera. El **agente** de cada
+casa lo ve en su long-poll, hace `docker pull` por digest, levanta el color que no está
+sirviendo, espera `healthy` y **reporta**.
+
+Con todas las casas reportadas, el CD verifica `Identidad.version` **él mismo** por gRPC: el
+reporte del agente es una pista, no la prueba. Si pasan todas, **un solo POST** a
+`/admin/backends` con todas las casas (primero agrega, después quita) y guarda el estado.
+
+Si **una** casa falla, o no reporta a tiempo, o el verify no cierra, el CD publica la generación
+siguiente **sin el color nuevo**: cada agente lo ve y baja la réplica que acababa de levantar. El
+balanceador nunca recibió un POST — nadie vio la versión rota. Abortar no tiene mecanismo propio,
+es el mismo camino que un deploy.
+
+La versión vieja no se baja: queda al lado para el rollback, que es el mismo POST al revés. Los
+detalles y los comandos exactos están en el repo del CD.
 
 ### El blue-green, adentro de una casa
 
@@ -194,10 +209,10 @@ salvo que se lo digas:
 
 ```bash
 sudo tee /etc/docker/daemon.json <<'EOF'
-{"insecure-registries": ["100.78.246.64:5000"]}
+{"insecure-registries": ["100.91.228.65:5000"]}
 EOF
 sudo systemctl restart docker
-docker pull 100.78.246.64:5000/sdypp-app-python:v1-ce2fbe3   # o el tag que esté publicado
+docker pull 100.91.228.65:5000/sdypp-app-python:v1-ce2fbe3   # o el tag que esté publicado
 ```
 
 ### 2 · El directorio de la casa
@@ -227,8 +242,8 @@ sudo ufw route allow in  on tailscale0
 sudo ufw route allow out on tailscale0
 sudo ufw allow in on tailscale0
 
-nc -vz 100.78.246.64 6379               # Redis: succeeded
-nc -vz 100.78.246.64 5000               # registry: succeeded
+nc -vz 100.91.228.65 6379               # Redis: succeeded
+nc -vz 100.91.228.65 5000               # registry: succeeded
 ```
 
 ⚠️ **Las dos primeras son de `route`, no de `allow`.** Es lo que más tiempo nos costó en toda la
@@ -238,29 +253,40 @@ entrega:
 | :--- | :--- | :--- |
 | `route allow in` | `FORWARD` | Que el balanceador **entre** a tu contenedor. Un puerto publicado con `-p` no termina en un proceso del host: se le hace DNAT hacia la IP del contenedor, así que pasa por `FORWARD`, no por `INPUT`. |
 | `route allow out` | `FORWARD` | Que tu contenedor **salga** hacia Redis y hacia el registry. Ese tráfico va `docker0 → tailscale0`, que también es `FORWARD`. |
-| `allow in` | `INPUT` | Que el CD **entre por SSH** a tu máquina. Es el único proceso propio que exponés, y sólo al tailnet. |
+| `allow in` | `INPUT` | Que el **balanceador** llegue a tu réplica por gRPC. Desde que el deploy lo hace el agente, ya no hace falta abrir SSH: lo único que escucha en tu máquina son las réplicas. |
 
 Con el `DEFAULT_FORWARD_POLICY="DROP"` que trae ufw, un `ufw allow in ... to any port 8080`
 **no sirve para las dos de `FORWARD`**, y el síntoma no apunta al firewall: la app responde
 `UNAVAILABLE` como si la base estuviera caída. Ojo también con que `tailscale ping` puede andar
 igual — lo contesta `tailscaled` sin pasar por el firewall.
 
-### 4 · La llave del CD
+### 4 · El agente
+
+**Ya no hace falta `sshd`, ni poner una clave ajena en tu `authorized_keys`, ni que el CD entre a
+tu máquina.** En vez de eso corrés un contenedor que sólo hace conexiones salientes:
 
 ```bash
-sudo systemctl enable --now ssh          # o sshd, según la distro
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-cat >> ~/.ssh/authorized_keys <<'EOF'
-<la id_deploy.pub que te pasó Tomás, una sola línea>
-EOF
-chmod 600 ~/.ssh/authorized_keys
+git clone https://github.com/SDyPPTpGrupal/cd && cd cd/agente
+docker build -t sdypp-agente:local .
+
+docker run -d --name sdypp-agente --restart unless-stopped --network host \
+    --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$HOME/sdypp:/casa" \
+    -e AG_CASA=casa-<vos> -e AG_EQUIPO=python \
+    -e AG_CD=http://100.101.15.93:8082 \
+    -e AG_TOKEN=<el que te pasó Tomás> \
+    -e AG_DIR=/casa -e "AG_DIR_HOST=$HOME/sdypp" \
+    sdypp-agente:local
 ```
 
-Va en el `authorized_keys` **de tu usuario**, no de root: el CD entra como vos y corre `docker`
-con tus permisos. La comprobación la hace Tomás desde Plataforma:
-`ssh casa-<vos> docker ps` tiene que responder sin pedir nada.
+La comprobación es tuya, no de Tomás: `docker logs sdypp-agente` tiene que mostrar la línea
+`agente | ARRIBA`. Si dice `objetivo | SIN-CD` es que no llega al CD — revisá Tailscale, pero
+tranquilo: sin CD el agente **no toca nada**, la réplica que esté sirviendo sigue sirviendo.
 
-No hay paso 5. **La réplica la levanta el CD** en el próximo deploy; vos no corrés ningún
+Las variables y el porqué de cada una están en `agente/README.md` del repo `cd`.
+
+No hay paso 5. **La réplica la levanta el agente** en el próximo deploy; vos no corrés ningún
 `docker run`. Para ver que llegó:
 
 ```bash

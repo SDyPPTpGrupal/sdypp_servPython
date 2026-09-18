@@ -11,7 +11,7 @@
 # del Dockerfile, así que un error de contrato revienta en esta terminal y no en
 # un contenedor ajeno con el deploy ya arrancado.
 #
-# Necesita: docker (con {"insecure-registries": ["100.78.246.64:5000"]} en
+# Necesita: docker (con {"insecure-registries": ["100.91.228.65:5000"]} en
 # /etc/docker/daemon.json), git, grpcurl, python3, y la clave ~/.ssh/id_deploy
 # autorizada en el CD para deploy-python, con este Host en ~/.ssh/config:
 #
@@ -26,7 +26,7 @@ set -euo pipefail
 # --- Configuración ---------------------------------------------------------
 # Todo sobreescribible por variable de entorno: en la demo no se edita el script.
 
-REGISTRY="${REGISTRY:-100.78.246.64:5000}"
+REGISTRY="${REGISTRY:-100.91.228.65:5000}"
 IMAGEN="${IMAGEN:-sdypp-app-python}"
 CD_SSH="${CD_SSH:-cd}"
 DIR_ENTRANTE="${DIR_ENTRANTE:-/cicd/python/entrante}"

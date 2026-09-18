@@ -40,7 +40,7 @@ EQUIPO = [
     {"nombre": "Mateo", "apellido": "Nomico", "legajo": 168102},
     {"nombre": "Salvador", "apellido": "Baez", "legajo": 195157},
 ]
-VERSION = 1
+VERSION = 3
 MENSAJE = "hola mundo python"
 
 # Metadatos del entorno y arranque.

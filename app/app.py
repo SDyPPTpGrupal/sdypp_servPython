@@ -27,6 +27,7 @@ from grpc_reflection.v1alpha import reflection
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import contrato_pb2 as pb
 import contrato_pb2_grpc as pb_grpc
+from worker import ConsumidorWorker
 
 # --- Configuración de la aplicación ---
 # Los valores de esta sección son contrato: ver CONTRATO.md. La App Java devuelve
@@ -51,6 +52,10 @@ ARRANCADO = datetime.now().astimezone().replace(microsecond=0).isoformat()
 
 # Hebras que atienden RPCs a la vez.
 WORKERS = int(os.environ.get("TP_WORKERS", 10))
+
+# Configuración de balanceador y colas
+BALANCEADOR_URL = os.environ.get("TP_BALANCEADOR_URL", os.environ.get("BALANCEADOR_URL", ""))
+WORKERS_COLA = int(os.environ.get("TP_WORKERS_COLA", "4"))
 
 REDIS_URL = os.environ.get("TP_REDIS_URL", "")
 
@@ -348,7 +353,8 @@ def servir(puerto: int = 8080):
     sys.stdout.reconfigure(line_buffering=True)
 
     servidor = grpc.server(futures.ThreadPoolExecutor(max_workers=WORKERS))
-    pb_grpc.add_ServicioServicer_to_server(Servicio(), servidor)
+    servicio_impl = Servicio()
+    pb_grpc.add_ServicioServicer_to_server(servicio_impl, servidor)
 
     # Health checking estándar de gRPC, además del RPC Salud del contrato: es lo que
     # entienden el HEALTHCHECK del contenedor y las herramientas del balanceador.
@@ -369,6 +375,15 @@ def servir(puerto: int = 8080):
 
     servidor.add_insecure_port(f"0.0.0.0:{puerto}")
     servidor.start()
+
+    # Iniciar consumidores de cola si hay un balanceador configurado
+    hilos_workers = []
+    if BALANCEADOR_URL:
+        print(f"[workers] Iniciando {WORKERS_COLA} hilos consumidores hacia {BALANCEADOR_URL}")
+        for i in range(1, WORKERS_COLA + 1):
+            w = ConsumidorWorker(BALANCEADOR_URL, servicio_impl, APP_NAME, CASA, i)
+            w.start()
+            hilos_workers.append(w)
 
     print(f"Servidor gRPC en 0.0.0.0:{puerto} (PID: {os.getpid()}) (Arrancado: {ARRANCADO})")
     print(f"[instancia] {APP_NAME}@{CASA} host={HOST} version={VERSION} workers={WORKERS}")

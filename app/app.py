@@ -27,7 +27,7 @@ from grpc_reflection.v1alpha import reflection
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import contrato_pb2 as pb
 import contrato_pb2_grpc as pb_grpc
-from worker import ConsumidorWorker
+from worker import ClienteCola, ConsumidorWorker
 
 # --- Configuración de la aplicación ---
 # Los valores de esta sección son contrato: ver CONTRATO.md. La App Java devuelve
@@ -53,9 +53,24 @@ ARRANCADO = datetime.now().astimezone().replace(microsecond=0).isoformat()
 # Hebras que atienden RPCs a la vez.
 WORKERS = int(os.environ.get("TP_WORKERS", 10))
 
-# Configuración de balanceador y colas
-BALANCEADOR_URL = os.environ.get("TP_BALANCEADOR_URL", os.environ.get("BALANCEADOR_URL", ""))
-WORKERS_COLA = int(os.environ.get("TP_WORKERS_COLA", "4"))
+# --- El worker de cola (docs/contrato-worker.md, sdypp_balanceador) --------
+# Seed list del clúster de colas, separada por comas. Vacío = no se consume
+# de ninguna cola: la réplica sólo atiende gRPC, que es el modo de antes de
+# este cambio y sigue siendo válido (por ejemplo, para la App Java).
+TP_COLA_URLS = [u.strip() for u in os.environ.get("TP_COLA_URL", "").split(",") if u.strip()]
+# El token de consumidor. Va al .env de cada casa, no al repo.
+TP_COLA_TOKEN = os.environ.get("TP_COLA_TOKEN", "")
+# Tiene que ser el mismo host:puerto gRPC que el balanceador usa como destino
+# en su pool (BA_BACKENDS): es lo que cruza "esta réplica está sana" con
+# "está consumiendo" sin traducir nada. El default sólo sirve si HOST_NAME ya
+# es un nombre alcanzable — en producción conviene fijarlo explícito.
+TP_COLA_CONSUMIDOR = os.environ.get("TP_COLA_CONSUMIDOR", "")
+# Consumidores concurrentes. Cada uno es un long-poll propio: más de uno por
+# proceso multiplica cuánto tarda en notarse que una réplica se apagó (cada
+# long-poll colgado reserva un pedido hasta que vence, uno por hilo).
+TP_COLA_HILOS = int(os.environ.get("TP_COLA_HILOS", "2"))
+# Segundos de long-polling de cada `tomar`. Techo del lado de la cola: 30.
+TP_COLA_ESPERA = int(os.environ.get("TP_COLA_ESPERA", "20"))
 
 REDIS_URL = os.environ.get("TP_REDIS_URL", "")
 
@@ -376,12 +391,16 @@ def servir(puerto: int = 8080):
     servidor.add_insecure_port(f"0.0.0.0:{puerto}")
     servidor.start()
 
-    # Iniciar consumidores de cola si hay un balanceador configurado
+    # Iniciar consumidores de cola si hay un clúster configurado. Le hablan
+    # DIRECTO a la cola, nunca al balanceador (docs/contrato-worker.md).
     hilos_workers = []
-    if BALANCEADOR_URL:
-        print(f"[workers] Iniciando {WORKERS_COLA} hilos consumidores hacia {BALANCEADOR_URL}")
-        for i in range(1, WORKERS_COLA + 1):
-            w = ConsumidorWorker(BALANCEADOR_URL, servicio_impl, APP_NAME, CASA, i)
+    if TP_COLA_URLS:
+        consumidor = TP_COLA_CONSUMIDOR or f"{HOST}:{puerto}"
+        cliente_cola = ClienteCola(TP_COLA_URLS, TP_COLA_TOKEN, consumidor)
+        print(f"[workers] {TP_COLA_HILOS} hilos consumiendo de {TP_COLA_URLS} "
+              f"como {consumidor}")
+        for i in range(1, TP_COLA_HILOS + 1):
+            w = ConsumidorWorker(cliente_cola, servicio_impl, APP_NAME, TP_COLA_ESPERA, i)
             w.start()
             hilos_workers.append(w)
 
@@ -401,6 +420,8 @@ def servir(puerto: int = 8080):
         # Primero se declara no-sana: el balanceador la saca de rotación y deja de
         # mandarle RPCs nuevos mientras todavía está atendiendo los que tiene.
         servicio_salud.enter_graceful_shutdown()
+        for w in hilos_workers:
+            w.detener()
         apagado.set()
 
     signal.signal(signal.SIGINT, detener)
